@@ -1,6 +1,28 @@
 # PlainSpeak
 Build Softwares using Natural Language instructions
 
+## Quick Start
+
+### Backend (FastAPI)
+```bash
+uv sync
+uv run python api.py
+```
+
+### Frontend
+
+**Development** (Vite dev server with API proxy):
+```bash
+cd frontend && npm install && npm run dev
+```
+Open http://localhost:5173
+
+**Production** (Node server serving built assets):
+```bash
+cd frontend && npm install && npm run build && npm run serve
+```
+Open http://localhost:5173
+
 # Requirements
 1. Need to be able to take the Natural Language Input and understand the requirement
 2. Ask for Clarification, to understand what user means by the query, as needed.

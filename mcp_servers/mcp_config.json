@@ -1,0 +1,8 @@
+{
+  "browser": {
+    "command": "uv",
+    "args": ["run", "server_browser.py"],
+    "type": "local-script",
+    "enabled": false
+  }
+}

@@ -1,0 +1,23 @@
+# Agent pipeline configuration - agent types are defined by prompts
+
+default_pipeline: default
+
+pipelines:
+  default:
+    - planner
+    - coder
+    - reviewer
+
+  minimal:
+    - planner
+    - coder
+
+steps:
+  - name: planner
+    prompt_file: prompts/planner.md
+
+  - name: coder
+    prompt_file: prompts/coder.md
+
+  - name: reviewer
+    prompt_file: prompts/reviewer.md

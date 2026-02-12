@@ -11,10 +11,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 API Starting up...")
-    # Add startup logic here (DB, caches, etc.)
+    # Start MCP servers
+    from shared.state import get_multi_mcp
+    multi_mcp = get_multi_mcp()
+    try:
+        await multi_mcp.start()
+    except Exception as e:
+        print(f"⚠️ MCP startup warning: {e}")
     yield
     print("🛑 API Shutting down...")
-    # Add shutdown logic here
+    await multi_mcp.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -31,15 +37,26 @@ app.add_middleware(
 
 # === Include Routers (add more as needed) ===
 from routers import example as example_router
+from routers import sessions as sessions_router
+from routers import mcp as mcp_router
+from routers import runs as runs_router
+from routers import stream as stream_router
 
 app.include_router(example_router.router, prefix="/api", tags=["example"])
+app.include_router(sessions_router.router, prefix="/api", tags=["sessions"])
+app.include_router(mcp_router.router, prefix="/api", tags=["mcp"])
+app.include_router(runs_router.router, prefix="/api", tags=["runs"])
+app.include_router(stream_router.router, prefix="/api", tags=["stream"])
 
 
 @app.get("/health")
 async def health_check():
+    from shared.state import get_multi_mcp
+    mcp = get_multi_mcp()
     return {
         "status": "ok",
         "version": "1.0.0",
+        "mcp_servers": mcp.get_connected_servers(),
     }
 
 
