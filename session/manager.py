@@ -62,6 +62,26 @@ class SessionManager:
         filepath = date_dir / f"session_{session_id}.json"
         with open(filepath, "w") as f:
             json.dump(data, f, indent=2, default=str)
+        if data.get("hlig_graph") is not None:
+            self.save_graph(session_id, data["hlig_graph"], date_dir=date_dir)
+        return filepath
+
+    def save_graph(self, session_id: str, graph_data: dict[str, Any], date_dir: Path | None = None) -> Path:
+        """
+        Save HLIG and DTG graph data to a separate JSON file (same location as session logs).
+
+        Args:
+            session_id: Session identifier
+            graph_data: HLIG graph dict (nodes with embedded DTGs, edges)
+            date_dir: Optional date directory; uses current date if not provided
+
+        Returns:
+            Path to saved graph file
+        """
+        date_dir = date_dir or self._date_dir()
+        filepath = date_dir / f"graph_{session_id}.json"
+        with open(filepath, "w") as f:
+            json.dump(graph_data, f, indent=2, default=str)
         return filepath
 
     def load_session(self, session_id: str) -> dict[str, Any] | None:
@@ -126,8 +146,9 @@ class SessionManager:
                             continue
                     except Exception:
                         pass
+                file_id = path.stem.replace("session_", "")
                 sessions.append({
-                    "session_id": data.get("session_id", path.stem.replace("session_", "")),
+                    "session_id": file_id,
                     "path": str(path),
                     "created_at": created,
                     "status": data.get("status", "unknown"),

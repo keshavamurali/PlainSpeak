@@ -7,6 +7,7 @@ import uuid
 
 if TYPE_CHECKING:
     from agents.base import BaseAgent
+    from core.plan_graph import PlanGraph
 
 
 @dataclass
@@ -38,11 +39,15 @@ class ExecutionContext:
         self._current_run: RunRecord | None = None
         # globals_schema: key-value store passed between agents (S18-style reads/writes)
         self.globals_schema: dict[str, Any] = {}
+        # plan_graph: DAG for tracking steps, replanning (set by runner)
+        self.plan_graph: "PlanGraph | None" = None
+        # hlig_graph: HLIG with per-node DTGs (set by runner after DTG generation)
+        self.hlig_graph: Any = None
 
     @classmethod
-    def create(cls, **kwargs: Any) -> "ExecutionContext":
+    def create(cls, session_id: str | None = None, **kwargs: Any) -> "ExecutionContext":
         """Create a new execution context with optional initial state."""
-        return cls(initial_input=kwargs)
+        return cls(session_id=session_id, initial_input=kwargs)
 
     def get_inputs(self, reads: list[str]) -> dict[str, Any]:
         """Get input data for agent from globals_schema (S18-style)."""
@@ -94,7 +99,7 @@ class ExecutionContext:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize context for logging/persistence."""
-        return {
+        d = {
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat(),
             "state": self.state,
@@ -110,3 +115,8 @@ class ExecutionContext:
                 for r in self.run_history
             ],
         }
+        if self.plan_graph:
+            d["plan_graph"] = self.plan_graph.to_dict()
+        if self.hlig_graph is not None and hasattr(self.hlig_graph, "to_dict"):
+            d["hlig_graph"] = self.hlig_graph.to_dict()
+        return d

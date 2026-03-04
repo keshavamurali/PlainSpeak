@@ -41,12 +41,14 @@ from routers import sessions as sessions_router
 from routers import mcp as mcp_router
 from routers import runs as runs_router
 from routers import stream as stream_router
+from routers import artifacts as artifacts_router
 
 app.include_router(example_router.router, prefix="/api", tags=["example"])
 app.include_router(sessions_router.router, prefix="/api", tags=["sessions"])
 app.include_router(mcp_router.router, prefix="/api", tags=["mcp"])
 app.include_router(runs_router.router, prefix="/api", tags=["runs"])
 app.include_router(stream_router.router, prefix="/api", tags=["stream"])
+app.include_router(artifacts_router.router, prefix="/api", tags=["artifacts"])
 
 
 @app.get("/health")

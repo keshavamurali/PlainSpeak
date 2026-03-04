@@ -1,10 +1,23 @@
 # Agent pipeline configuration - agent types are defined by prompts
 
-default_pipeline: default
+default_pipeline: hlig_full
 
 pipelines:
+  # Full HLIG pipeline: Planner -> Designer -> Design Review -> Code -> Code Review -> Build -> Unit Test -> Integration Test -> System Test
+  hlig_full:
+    - planner
+    - designer
+    - design_reviewer
+    - coder
+    - code_reviewer
+    - builder
+    - unit_tester
+    - integration_tester
+    - system_tester
+
   default:
     - planner
+    - clarification
     - coder
     - reviewer
 
@@ -15,9 +28,48 @@ pipelines:
 steps:
   - name: planner
     prompt_file: prompts/planner.md
+    description: Analyze requirements and produce HLIG (High-Level Intent Graph)
+
+  - name: designer
+    prompt_file: prompts/dtg_generator.md
+    description: Build DTG (Detailed Task Graph) for each HLIG node
+
+  - name: dtg_generator
+    prompt_file: prompts/dtg_generator.md
+    description: Generate Detailed Task Graph from each HLIG node (alias for designer)
+
+  - name: design_reviewer
+    prompt_file: prompts/design_reviewer.md
+    description: Review HLIG and DTGs for correctness, dependencies, inconsistencies
 
   - name: coder
     prompt_file: prompts/coder.md
+    description: Implement code per DTG node based on design
+
+  - name: code_reviewer
+    prompt_file: prompts/code_reviewer.md
+    description: Review generated code for correctness and dependencies
+
+  - name: builder
+    prompt_file: prompts/builder.md
+    description: Build generated code using sandbox (MCP)
+
+  - name: unit_tester
+    prompt_file: prompts/unit_tester.md
+    description: Generate and run unit tests for each node
+
+  - name: integration_tester
+    prompt_file: prompts/integration_tester.md
+    description: Generate integration tests and verify interfaces between nodes
+
+  - name: system_tester
+    prompt_file: prompts/system_tester.md
+    description: Full system-level testing
+
+  - name: clarification
+    prompt_file: prompts/clarification.md
+    description: Ask user for clarification when needed
 
   - name: reviewer
     prompt_file: prompts/reviewer.md
+    description: Review code and suggest improvements

@@ -1,0 +1,6 @@
+{
+  "agent": {
+    "model_provider": "gemini",
+    "default_model": "gemini"
+  }
+}
