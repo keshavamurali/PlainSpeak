@@ -1,13 +1,42 @@
 """Debug logging - writes step I/O and LLM I/O to debug_logs/, session-based like session_log."""
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEBUG_LOGS_BASE = PROJECT_ROOT / "debug_logs" / "sessions"
-MAX_LOG_BODY_CHARS = 8000  # Truncate very long content for readability
+# Truncation: DEBUG_LOG_MAX_CHARS env (default 8000). Use 0 for no truncation.
+_DEFAULT_MAX = 8000
+# Cost limit: COST_LIMIT_USD env (default 0.25). Run stops when exceeded. Use 0 to disable.
+_COST_LIMIT = 0.25
+try:
+    _cl = os.environ.get("COST_LIMIT_USD", "")
+    _COST_LIMIT = float(_cl) if _cl else 0.25
+except (ValueError, TypeError):
+    _COST_LIMIT = 0.25
+
+
+class CostLimitExceeded(Exception):
+    """Raised when session LLM cost exceeds COST_LIMIT_USD. Stops the run."""
+
+    def __init__(self, session_id: str, cost_usd: float, limit_usd: float):
+        self.session_id = session_id
+        self.cost_usd = cost_usd
+        self.limit_usd = limit_usd
+        super().__init__(
+            f"Cost limit exceeded: run {session_id} cost ${cost_usd:.4f} exceeds limit ${limit_usd:.2f}. Run stopped."
+        )
+
+
+_env_val = os.environ.get("DEBUG_LOG_MAX_CHARS", "")
+try:
+    _n = int(_env_val) if _env_val else _DEFAULT_MAX
+    MAX_LOG_BODY_CHARS = _n if _n > 0 else 0
+except ValueError:
+    MAX_LOG_BODY_CHARS = _DEFAULT_MAX
 
 
 def _date_dir(dt: datetime | None = None) -> Path:
@@ -24,10 +53,11 @@ def _log_path(session_id: str) -> Path:
     return _date_dir() / f"debug_session_{sid}.log"
 
 
-def _truncate(s: str, max_len: int = MAX_LOG_BODY_CHARS) -> str:
-    if len(s) <= max_len:
+def _truncate(s: str, max_len: int | None = None) -> str:
+    limit = max_len if max_len is not None else MAX_LOG_BODY_CHARS
+    if limit <= 0 or len(s) <= limit:
         return s
-    return s[:max_len] + f"\n... [truncated, total {len(s)} chars]"
+    return s[:limit] + f"\n... [truncated, total {len(s)} chars]"
 
 
 def _format_value(val: Any, max_len: int = MAX_LOG_BODY_CHARS) -> str:
@@ -69,13 +99,63 @@ def log_step_end(session_id: str, step_name: str, output: dict | Any) -> None:
     _write(session_id, entry)
 
 
-def log_llm_call(session_id: str, agent_name: str, prompt: str, response: str) -> None:
-    """Log LLM input (prompt) and output (response)."""
+# Per-session token/cost accumulator for run summaries
+_session_usage: dict[str, dict] = {}
+
+
+def accumulate_usage(session_id: str, usage: dict) -> None:
+    """Accumulate token usage for session summary. Raises CostLimitExceeded if limit exceeded."""
+    if not session_id or not usage:
+        return
+    key = session_id.strip() or "no_session"
+    if key not in _session_usage:
+        _session_usage[key] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+    acc = _session_usage[key]
+    acc["input_tokens"] += usage.get("input_tokens", 0)
+    acc["output_tokens"] += usage.get("output_tokens", 0)
+    acc["total_tokens"] += usage.get("total_tokens", 0)
+    acc["cost_usd"] += usage.get("cost_usd", 0.0)
+    if _COST_LIMIT > 0 and acc["cost_usd"] > _COST_LIMIT:
+        raise CostLimitExceeded(session_id, acc["cost_usd"], _COST_LIMIT)
+
+
+def get_session_usage(session_id: str) -> dict:
+    """Get accumulated usage for a session. Returns empty dict if none."""
+    key = (session_id or "").strip() or "no_session"
+    return dict(_session_usage.get(key, {}))
+
+
+def log_llm_call(
+    session_id: str,
+    agent_name: str,
+    prompt: str,
+    response: str,
+    usage: dict | None = None,
+    variable_input: str | None = None,
+) -> None:
+    """Log LLM output (response) and token usage. Logs only variable_input (not prompt template) when provided."""
+    if usage:
+        accumulate_usage(session_id, usage)
     ts = _timestamp()
-    prompt_str = _truncate(prompt)
     response_str = _truncate(response)
     entry = f"\n{'='*80}\n[{ts}] LLM_CALL   | session={session_id} | agent={agent_name}\n"
-    entry += f"PROMPT ({len(prompt)} chars):\n{prompt_str}\n"
+    if usage:
+        inp = usage.get("input_tokens", 0)
+        out = usage.get("output_tokens", 0)
+        total = usage.get("total_tokens", inp + out)
+        cost = usage.get("cost_usd", 0)
+        model = usage.get("model", "")
+        entry += f"USAGE: input={inp} output={out} total={total} cost=${cost:.6f} model={model}\n"
+        if session_id:
+            totals = get_session_usage(session_id)
+            cum_cost = totals.get("cost_usd", 0)
+            entry += f"CUMULATIVE: cost=${cum_cost:.6f} (this run so far)\n"
+    if variable_input is not None:
+        inp_str = _truncate(variable_input)
+        entry += f"INPUT (variable part only, prompt template omitted, {len(variable_input)} chars):\n{inp_str}\n"
+    else:
+        prompt_str = _truncate(prompt)
+        entry += f"PROMPT ({len(prompt)} chars):\n{prompt_str}\n"
     entry += f"RESPONSE ({len(response)} chars):\n{response_str}\n"
     _write(session_id, entry)
 
@@ -86,6 +166,17 @@ def log_pipeline_event(session_id: str, event: str, details: str | dict | None =
     entry = f"[{ts}] PIPELINE   | session={session_id} | {event}\n"
     if details:
         entry += f"  {_format_value(details, max_len=2000)}\n"
+    _write(session_id, entry)
+
+
+def log_token_summary(session_id: str, totals: dict) -> None:
+    """Log session-level token and cost summary (call at run end)."""
+    ts = _timestamp()
+    cost_usd = totals.get("cost_usd", 0)
+    entry = f"\n{'='*80}\n[{ts}] TOKEN_SUMMARY | session={session_id}\n"
+    entry += f"  input_tokens={totals.get('input_tokens', 0)} output_tokens={totals.get('output_tokens', 0)} "
+    entry += f"total={totals.get('total_tokens', 0)}\n"
+    entry += f"  TOTAL RUN COST: ${cost_usd:.6f}\n"
     _write(session_id, entry)
 
 

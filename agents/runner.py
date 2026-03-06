@@ -8,12 +8,14 @@ from typing import Any, Callable
 from context.execution_context import ExecutionContext
 from agents.base import BaseAgent
 from core.plan_graph import PlanGraph
-from core.hlig_dtg_graphs import HLIGGraph, DTGGraph
+from core.hlig_dtg_graphs import HLIGGraph, DTGGraph, GraphCycleError
 
 try:
-    from core.debug_logger import log_pipeline_event, log_user_input
+    from core.debug_logger import log_pipeline_event, log_user_input, get_session_usage, log_token_summary
 except ImportError:
     log_pipeline_event = log_user_input = lambda *a, **kw: None
+    get_session_usage = lambda _: {}
+    log_token_summary = lambda *a, **kw: None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SESSIONS_BASE = PROJECT_ROOT / "session_log" / "sessions"
@@ -34,41 +36,8 @@ def _get_event_bus():
         return None
 
 
-def _hlig_to_plan(hlig_data: dict) -> dict:
-    """Convert HLIG format (from prompts/planner.md) to PlanGraph-compatible format."""
-    hlig = hlig_data.get("hlig", {})
-    hlig_nodes = hlig.get("nodes", [])
-    hlig_edges = hlig.get("edges", [])
-    nodes = []
-    edges = []
-    for n in hlig_nodes:
-        nid = n.get("id", "")
-        if not nid:
-            continue
-        nodes.append({
-            "id": nid,
-            "agent": "coder",
-            "description": n.get("task", ""),
-            "reads": n.get("inputs", []),
-            "writes": n.get("outputs", []),
-        })
-    for e in hlig_edges:
-        src = e.get("from")
-        tgt = e.get("to")
-        if src and tgt:
-            edges.append({"source": src, "target": tgt})
-    if not nodes:
-        return {}
-    # Connect ROOT to nodes with no incoming edges
-    has_incoming = {e.get("to") for e in hlig_edges if e.get("to")}
-    for n in nodes:
-        if n["id"] not in has_incoming:
-            edges.insert(0, {"source": PlanGraph.ROOT, "target": n["id"]})
-    return {"nodes": nodes, "edges": edges}
-
-
 def _default_plan_from_config(steps: list[dict], pipeline: list[str]) -> dict:
-    """Build a linear plan from config when Planner doesn't produce valid plan_graph."""
+    """Build PlanGraph from pipeline config. Planner produces HLIG only; execution plan comes from config."""
     nodes = []
     edges = []
     prev = PlanGraph.ROOT
@@ -89,7 +58,7 @@ def _default_plan_from_config(steps: list[dict], pipeline: list[str]) -> dict:
 
 
 class AgentRunner:
-    """Runs agents based on a Plan Graph. Planner generates the plan; runner executes the DAG."""
+    """Runs agents based on a Plan Graph. Plan is built from config; Planner produces HLIG only."""
 
     def __init__(
         self,
@@ -116,7 +85,7 @@ class AgentRunner:
 
     def _run_dtg_generator(self, hlig_node: dict, steps: dict, ctx: ExecutionContext) -> dict | None:
         """Run DTG generator (designer) for one HLIG node. Returns parsed DTG dict or None."""
-        spec = steps.get("designer") or steps.get("dtg_generator")
+        spec = steps.get("designer")
         if not spec:
             return None
         prompt_file = spec.get("prompt_file")
@@ -152,10 +121,10 @@ class AgentRunner:
             "task": hlig_node.get("task"),
             "inputs": hlig_node.get("inputs", []),
             "outputs": hlig_node.get("outputs", []),
-            "language": hlig_node.get("language", "TBD"),
+            "language": hlig_node.get("language", "Rust, Tauri, React, CSS"),
             "external_interfaces": hlig_node.get("external_interfaces", []),
         }
-        lang = hlig_node.get("language", "TBD")
+        lang = hlig_node.get("language", "Rust, Tauri, React, CSS")
         for n in dtg_out["nodes"]:
             if isinstance(n, dict):
                 n["parent_hlig"] = parent_hlig
@@ -163,16 +132,41 @@ class AgentRunner:
         return dtg_out
 
     def _generate_dtgs_for_hlig(self, ctx: ExecutionContext, hlig_graph: HLIGGraph, steps: dict) -> None:
-        """Traverse HLIG nodes, generate DTG for each, attach to node."""
-        for nid, data in hlig_graph.nodes():
+        """Traverse HLIG nodes, generate DTG for each, attach to node. Retries designer once on DTG cycle."""
+        designer_config = (steps.get("designer") or {}).get("config") or {}
+        for nid, data in list(hlig_graph.nodes()):
             node_dict = {"id": nid, **{k: v for k, v in data.items() if k != "dtg" and not callable(v)}}
+            node_dict.update(designer_config)  # Inject max_design_nodes, max_code_nodes for coarser DTG
             log_pipeline_event(ctx.session_id, "dtg_generation_started", {"hlig_node": nid})
             dtg_out = self._run_dtg_generator(node_dict, steps, ctx)
             if dtg_out and isinstance(dtg_out, dict):
                 dtg_out = self._enrich_dtg_nodes(dtg_out, node_dict)
-                dtg = DTGGraph.from_dict(dtg_out)
-                hlig_graph.set_node_dtg(nid, dtg)
-                log_pipeline_event(ctx.session_id, "dtg_generation_completed", {"hlig_node": nid, "dtg_nodes": len(dtg_out.get("nodes", []))})
+                try:
+                    dtg = DTGGraph.from_dict(dtg_out)
+                    hlig_graph.set_node_dtg(nid, dtg)
+                    log_pipeline_event(ctx.session_id, "dtg_generation_completed", {"hlig_node": nid, "dtg_nodes": len(dtg_out.get("nodes", []))})
+                except GraphCycleError as e:
+                    log_pipeline_event(
+                        ctx.session_id,
+                        "graph_cycle_detected",
+                        {"graph_type": "DTG", "hlig_node": nid, "cycle_edges": e.cycle_edges, "retry": 1},
+                    )
+                    retry_dict = {
+                        **node_dict,
+                        "dtg_cycle_retry_hint": str(e),
+                        "dtg_cycle_edges": e.cycle_edges,
+                    }
+                    dtg_out_retry = self._run_dtg_generator(retry_dict, steps, ctx)
+                    if dtg_out_retry and isinstance(dtg_out_retry, dict):
+                        dtg_out_retry = self._enrich_dtg_nodes(dtg_out_retry, node_dict)
+                        try:
+                            dtg = DTGGraph.from_dict(dtg_out_retry)
+                            hlig_graph.set_node_dtg(nid, dtg)
+                            log_pipeline_event(ctx.session_id, "dtg_generation_completed", {"hlig_node": nid, "dtg_nodes": len(dtg_out_retry.get("nodes", [])), "after_retry": True})
+                        except GraphCycleError as e2:
+                            log_pipeline_event(ctx.session_id, "dtg_generation_skipped", {"hlig_node": nid, "reason": "cycle_after_retry", "error": str(e2)})
+                    else:
+                        log_pipeline_event(ctx.session_id, "dtg_generation_skipped", {"hlig_node": nid, "reason": "no valid output after cycle retry"})
             else:
                 log_pipeline_event(ctx.session_id, "dtg_generation_skipped", {"hlig_node": nid, "reason": "no valid output"})
 
@@ -191,7 +185,7 @@ class AgentRunner:
             config=spec.get("config", {}),
             multi_mcp=self._multi_mcp,
             reads=["original_query", "user_clarification"],
-            writes=["plan_graph"],
+            writes=["hlig"],
         )
         ctx = agent.run(ctx)
         artifact = ctx.get_artifact("planner", {})
@@ -252,6 +246,7 @@ class AgentRunner:
         """
         Trigger MCP build_dtg_output for each HLIG with generated artifacts.
         Uses Tauri + Node.js sandbox. Runs async via event loop from sync context.
+        Sets ctx.globals_schema["build_failed"] = True if any build fails (testers skip).
         """
         if not self._multi_mcp or not ctx.hlig_graph:
             return
@@ -260,6 +255,7 @@ class AgentRunner:
             return
         import asyncio
 
+        build_failed = False
         for nid, data in ctx.hlig_graph.nodes():
             if not data.get("dtg"):
                 continue
@@ -282,11 +278,16 @@ class AgentRunner:
                 try:
                     parsed = json.loads(text)
                     status = parsed.get("status", "unknown")
+                    if str(status).lower() in ("failure", "failed", "error"):
+                        build_failed = True
                     log_pipeline_event(ctx.session_id, "build_triggered", {"hlig_id": nid, "build_status": status})
                 except json.JSONDecodeError:
                     log_pipeline_event(ctx.session_id, "build_triggered", {"hlig_id": nid, "output": text[:500]})
             except Exception as e:
+                build_failed = True
                 log_pipeline_event(ctx.session_id, "build_error", {"hlig_id": nid, "error": str(e)})
+        if build_failed:
+            ctx.globals_schema["build_failed"] = True
 
     def _run_pipeline_phase(
         self,
@@ -307,12 +308,33 @@ class AgentRunner:
             ctx.add_artifact("designer", {"output": "DTGs attached to HLIG nodes"})
             return ctx
 
+        if agent_name == "design_doc_generator":
+            if not ctx.hlig_graph:
+                ctx.add_artifact("design_doc_generator", {"output": "No HLIG graph; skipping design docs"})
+                return ctx
+            try:
+                from core.dtg_artifact_generator import DTGArtifactGenerator
+                dt = datetime.now()
+                date_dir = SESSIONS_BASE / str(dt.year) / f"{dt.month:02d}" / f"{dt.day:02d}"
+                date_dir.mkdir(parents=True, exist_ok=True)
+                gen = DTGArtifactGenerator()
+                outputs_path = gen.generate_design_docs_only(ctx.hlig_graph, ctx.session_id, date_dir)
+                if outputs_path:
+                    ctx.globals_schema["artifact_outputs_path"] = str(outputs_path)
+                    log_pipeline_event(ctx.session_id, "design_docs_generated", {"path": str(outputs_path)})
+                ctx.add_artifact("design_doc_generator", {"output": "Design docs generated", "path": str(outputs_path) if outputs_path else None})
+            except Exception as e:
+                log_pipeline_event(ctx.session_id, "artifact_generation_error", {"error": str(e)})
+                ctx.add_artifact("design_doc_generator", {"output": f"Error: {e}", "error": str(e)})
+            return ctx
+
         if agent_name == "design_reviewer":
             spec = steps.get("design_reviewer", {})
             prompt_file = spec.get("prompt_file")
             input_data = {
                 "hlig_graph": ctx.hlig_graph.to_dict() if ctx.hlig_graph and hasattr(ctx.hlig_graph, "to_dict") else {},
                 "original_query": ctx.globals_schema.get("original_query", ctx.get_state("query", "")),
+                "artifact_outputs_path": ctx.globals_schema.get("artifact_outputs_path", ""),
             }
             agent = BaseAgent(
                 name="design_reviewer",
@@ -329,12 +351,21 @@ class AgentRunner:
                 ctx.add_artifact("coder", {"output": "No HLIG graph; nothing to generate"})
                 return ctx
             try:
-                from core.dtg_artifact_generator import DTGArtifactGenerator
-                dt = datetime.now()
-                date_dir = SESSIONS_BASE / str(dt.year) / f"{dt.month:02d}" / f"{dt.day:02d}"
-                date_dir.mkdir(parents=True, exist_ok=True)
+                from core.dtg_artifact_generator import DTGArtifactGenerator, _write_interface_definitions
                 gen = DTGArtifactGenerator()
-                outputs_path = gen.generate_all(ctx.hlig_graph, ctx.session_id, date_dir)
+                outputs_path = None
+                existing_outputs = ctx.globals_schema.get("artifact_outputs_path")
+                if existing_outputs and Path(existing_outputs).exists():
+                    outputs_path = gen.generate_code_only(ctx.hlig_graph, ctx.session_id, Path(existing_outputs))
+                else:
+                    # No design docs: create outputs dir, write interfaces, generate code only (saves LLM cost)
+                    dt = datetime.now()
+                    date_dir = SESSIONS_BASE / str(dt.year) / f"{dt.month:02d}" / f"{dt.day:02d}"
+                    date_dir.mkdir(parents=True, exist_ok=True)
+                    outputs_dir = date_dir / f"outputs_{ctx.session_id}"
+                    outputs_dir.mkdir(parents=True, exist_ok=True)
+                    _write_interface_definitions(ctx.hlig_graph, outputs_dir)
+                    outputs_path = gen.generate_code_only(ctx.hlig_graph, ctx.session_id, outputs_dir)
                 if outputs_path:
                     ctx.globals_schema["artifact_outputs_path"] = str(outputs_path)
                     log_pipeline_event(ctx.session_id, "artifact_generation_completed", {"path": str(outputs_path)})
@@ -369,6 +400,10 @@ class AgentRunner:
             return ctx
 
         if agent_name in ("unit_tester", "integration_tester", "system_tester"):
+            if ctx.globals_schema.get("build_failed"):
+                ctx.add_artifact(agent_name, {"output": "Skipped (build failed)", "skipped": True})
+                log_pipeline_event(ctx.session_id, "tester_skipped", {"agent": agent_name, "reason": "build_failed"})
+                return ctx
             spec = steps.get(agent_name, {})
             prompt_file = spec.get("prompt_file")
             input_data = {
@@ -409,8 +444,6 @@ class AgentRunner:
                     ctx.globals_schema[key] = artifact[key]
                 elif key not in ctx.globals_schema and "output" in artifact:
                     ctx.globals_schema[key] = artifact["output"]
-                elif key not in ctx.globals_schema and "plan_graph" in artifact:
-                    ctx.globals_schema[key] = artifact["plan_graph"]
 
     def run(
         self,
@@ -422,7 +455,7 @@ class AgentRunner:
     ) -> ExecutionContext:
         """
         Run using Plan Graph:
-        1. Run Planner to get plan (or use default from config)
+        1. Run Planner to get HLIG (with clarification loop); build plan from config
         2. Execute DAG: get_ready_steps, run each, mark done
         3. Support replanning on failure (optional)
         """
@@ -480,30 +513,41 @@ class AgentRunner:
                     "user_clarification",
                 )
                 log_user_input(ctx.session_id, "planner_clarification", msg, user_response)
-                ctx.globals_schema["user_clarification"] = user_response
+                # Accumulate responses so planner sees full history (avoids repeated questions)
+                existing = ctx.globals_schema.get("user_clarification", "")
+                ctx.globals_schema["user_clarification"] = (
+                    f"{existing}\n\n{user_response}".strip() if existing else user_response
+                )
+                if on_step_complete:
+                    try:
+                        on_step_complete(ctx)
+                    except Exception:
+                        pass
                 continue
             if planner_out.get("hlig"):
-                hlig_graph = HLIGGraph.from_planner_hlig(planner_out)
-                if hlig_graph:
-                    ctx.hlig_graph = hlig_graph
-                    # Full pipeline: use linear plan, designer runs in Phase 2
-                    if "designer" in step_names and "design_reviewer" in step_names:
-                        plan_dict = _default_plan_from_config(list(steps.values()), step_names)
-                    else:
-                        plan_dict = _hlig_to_plan(planner_out)
-                        if plan_dict:
-                            self._generate_dtgs_for_hlig(ctx, hlig_graph, steps)
-                else:
-                    plan_dict = _default_plan_from_config(list(steps.values()), step_names)
-                break
-            pg = planner_out.get("plan_graph")
-            if pg and isinstance(pg, dict) and pg.get("nodes"):
-                plan_dict = pg
-                break
-            plan_dict = _default_plan_from_config(
-                list(steps.values()),
-                step_names,
-            )
+                try:
+                    hlig_graph = HLIGGraph.from_planner_hlig(planner_out)
+                    if hlig_graph:
+                        ctx.hlig_graph = hlig_graph
+                except GraphCycleError as e:
+                    retry_count = ctx.globals_schema.get("hlig_cycle_retry_count", 0)
+                    log_pipeline_event(
+                        ctx.session_id,
+                        "graph_cycle_detected",
+                        {"graph_type": "HLIG", "cycle_edges": e.cycle_edges, "retry": retry_count + 1},
+                    )
+                    if retry_count < 1:
+                        ctx.globals_schema["hlig_cycle_retry_count"] = retry_count + 1
+                        existing = ctx.globals_schema.get("user_clarification", "")
+                        ctx.globals_schema["user_clarification"] = (
+                            f"{existing}\n\n[System: The previous HLIG graph contained a cycle: {e}. "
+                            "Please output a new HLIG with edges that form a DAG (no circular dependencies).]".strip()
+                            if existing
+                            else f"[System: The HLIG graph contained a cycle: {e}. Please output an HLIG with edges that form a DAG (no circular dependencies).]"
+                        )
+                        continue
+                    raise
+            plan_dict = _default_plan_from_config(list(steps.values()), step_names)
             break
 
         plan = PlanGraph.from_dict(plan_dict)
@@ -518,23 +562,6 @@ class AgentRunner:
             if planner_node_id:
                 planner_artifact = ctx.get_artifact("planner", {})
                 plan.mark_done(planner_node_id, output=planner_artifact.get("output") if isinstance(planner_artifact, dict) else planner_artifact)
-
-        # Legacy: Generate design docs and code when using old HLIG-to-plan (no designer step)
-        if ctx.hlig_graph is not None and "designer" not in step_names:
-            try:
-                from core.dtg_artifact_generator import DTGArtifactGenerator
-                dt = datetime.now()
-                date_dir = SESSIONS_BASE / str(dt.year) / f"{dt.month:02d}" / f"{dt.day:02d}"
-                date_dir.mkdir(parents=True, exist_ok=True)
-                gen = DTGArtifactGenerator()
-                outputs_path = gen.generate_all(ctx.hlig_graph, ctx.session_id, date_dir)
-                if outputs_path:
-                    ctx.globals_schema["artifact_outputs_path"] = str(outputs_path)
-                    log_pipeline_event(ctx.session_id, "artifact_generation_completed", {"path": str(outputs_path)})
-                    self._provision_dependencies(ctx, outputs_path)
-                    self._trigger_builds_for_hlig(ctx)
-            except Exception as e:
-                log_pipeline_event(ctx.session_id, "artifact_generation_error", {"error": str(e)})
 
         log_pipeline_event(ctx.session_id, "phase2_dag", {"plan": plan_dict})
 
@@ -583,7 +610,19 @@ class AgentRunner:
                             write_key,
                         )
                         log_user_input(ctx.session_id, node_id, cl_msg, user_response)
-                        ctx.globals_schema[write_key] = user_response
+                        # Accumulate when write_key is user_clarification (avoids repeated questions)
+                        if write_key == "user_clarification":
+                            existing = ctx.globals_schema.get(write_key, "")
+                            ctx.globals_schema[write_key] = (
+                                f"{existing}\n\n{user_response}".strip() if existing else user_response
+                            )
+                        else:
+                            ctx.globals_schema[write_key] = user_response
+                        if on_step_complete:
+                            try:
+                                on_step_complete(ctx)
+                            except Exception:
+                                pass
                         out_val = {"clarificationMessage": out_val.get("clarificationMessage"), "user_response": user_response}
                         plan.mark_done(node_id, output=out_val)
                     else:
@@ -624,6 +663,16 @@ class AgentRunner:
                 except Exception as e:
                     plan.mark_failed(node_id, error=str(e))
                     raise
+
+        # Log session-level token/cost summary and run completed with total cost
+        totals = get_session_usage(ctx.session_id)
+        if totals:
+            log_token_summary(ctx.session_id, totals)
+            log_pipeline_event(
+                ctx.session_id,
+                "run_completed",
+                {"total_cost_usd": totals.get("cost_usd", 0), "total_tokens": totals.get("total_tokens", 0)},
+            )
 
         return ctx
 

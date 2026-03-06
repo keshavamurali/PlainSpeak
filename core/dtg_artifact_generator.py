@@ -7,6 +7,7 @@ CVP (Causal Visual Programming) integration:
 """
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -14,11 +15,74 @@ from typing import Any
 from core.hlig_dtg_graphs import HLIGGraph, DTGGraph
 
 try:
-    from core.debug_logger import log_pipeline_event
+    from core.debug_logger import log_pipeline_event, CostLimitExceeded
 except ImportError:
     log_pipeline_event = lambda *a, **kw: None
+    CostLimitExceeded = Exception  # noqa: type to satisfy isinstance
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Configurable context truncation (env: DESIGN_CONTEXT_MAX_CHARS, CODE_CONTEXT_MAX_CHARS). Reduces input tokens.
+# Use 0 for no truncation.
+def _ctx_limit(name: str, default: int) -> int:
+    v = os.environ.get(name, "")
+    return int(v) if v else default
+
+
+_DESIGN_CTX = _ctx_limit("DESIGN_CONTEXT_MAX_CHARS", 2000)
+_CODE_CTX = _ctx_limit("CODE_CONTEXT_MAX_CHARS", 1500)
+
+
+def _truncate_design(s: str) -> str:
+    return s[:_DESIGN_CTX] if _DESIGN_CTX > 0 else s
+
+
+def _truncate_code(s: str) -> str:
+    return s[:_CODE_CTX] if _CODE_CTX > 0 else s
+
+
+def _make_code_output_spec(node_id: str, files: list[tuple[str, str]]) -> str:
+    """Build canonical code_output JSON for LLM consumption (dependency context)."""
+    spec = {
+        "type": "code_output",
+        "version": "1.0",
+        "node_id": node_id,
+        "files": [
+            {"path": p, "content_preview": _truncate_code(c)}
+            for p, c in files
+        ],
+    }
+    return json.dumps(spec, indent=2, default=str)
+
+
+def _make_dtg_node_ref(dep_node: dict) -> str:
+    """Build canonical dtg_node_ref JSON when design spec is missing (e.g. hlig_no_design_docs)."""
+    ref = {
+        "type": "dtg_node_ref",
+        "version": "1.0",
+        "node_id": dep_node.get("id", ""),
+        "title": dep_node.get("title", ""),
+        "description": dep_node.get("description", ""),
+        "inputs_required": dep_node.get("inputs_required", []),
+        "outputs_produced": dep_node.get("outputs_produced", []),
+        "success_criteria": dep_node.get("success_criteria", []),
+    }
+    return json.dumps(ref, indent=2, default=str)
+
+
+def _build_dep_ctx(deps: list[str], resolved: dict[str, str], nodes_by_id: dict[str, dict]) -> dict[str, str]:
+    """Build dependency_context with canonical formats. Injects dtg_node_ref when design spec is missing."""
+    result: dict[str, str] = {}
+    for dep in deps:
+        content = resolved.get(dep)
+        if content:
+            result[dep] = content
+            continue
+        node = nodes_by_id.get(dep)
+        if node and (node.get("task_type") or "").lower() in ("design", "documentation"):
+            result[dep] = _make_dtg_node_ref(node)
+    return result
+
 
 # -----------------------------------------------------------------------------
 # CVP: Metadata key for causal path in generated artifacts (traceability)
@@ -33,7 +97,7 @@ def _infer_framework(hlig_node: dict) -> str:
     """
     task = (hlig_node.get("task") or "").lower()
     interfaces = [str(x).lower() for x in hlig_node.get("external_interfaces", [])]
-    lang = (hlig_node.get("language") or "TBD").lower()
+    lang = (hlig_node.get("language") or "Rust, Tauri, React, CSS").lower()
 
     if "desktop" in task or "tauri" in lang or "rust" in lang:
         return "rust-tauri"
@@ -45,12 +109,17 @@ def _infer_framework(hlig_node: dict) -> str:
         return "rust-tauri"
     if "API" in interfaces or "DB" in interfaces:
         return "rust-tauri"
-    return "node-react"  # default for web-related
+    return "rust-tauri"  # default: Rust, Tauri, React, CSS
 
 
 def _topological_order(dtg: DTGGraph) -> list[dict]:
     """Return DTG nodes in topological order (designs before code)."""
     import networkx as nx
+
+    try:
+        from networkx.exception import NetworkXUnfeasible
+    except ImportError:
+        NetworkXUnfeasible = type("NetworkXUnfeasible", (Exception,), {})
 
     d = dtg.to_dict()
     nodes = d.get("nodes", [])
@@ -65,7 +134,7 @@ def _topological_order(dtg: DTGGraph) -> list[dict]:
             g.add_edge(src, tgt)
     try:
         order = list(nx.topological_sort(g))
-    except nx.NetworkXError:
+    except (nx.NetworkXError, NetworkXUnfeasible):
         order = list(nodes_by_id.keys())
     return [nodes_by_id[nid] for nid in order if nid in nodes_by_id]
 
@@ -73,6 +142,53 @@ def _topological_order(dtg: DTGGraph) -> list[dict]:
 def _safe_filename(name: str) -> str:
     """Convert title to safe filename."""
     return re.sub(r"[^\w\-_]", "_", name).strip("_") or "untitled"
+
+
+def _get_interfaces_for_hlig(hlig_graph: HLIGGraph, hlig_id: str) -> list[dict]:
+    """Extract interface definitions for edges involving the given HLIG node."""
+    result: list[dict] = []
+    for u, v, data in hlig_graph.edges():
+        if u != hlig_id and v != hlig_id:
+            continue
+        spec = data.get("interface_spec")
+        ref = data.get("interface_ref")
+        if spec and isinstance(spec, dict):
+            result.append({
+                "from": u, "to": v,
+                "interface_type": data.get("interface_type", "dependency"),
+                **{k: v for k, v in spec.items() if k in ("type", "description", "endpoints", "schema", "ref")},
+            })
+        elif ref:
+            result.append({"from": u, "to": v, "interface_ref": ref, "interface_type": data.get("interface_type", "dependency")})
+    return result
+
+
+def _write_interface_definitions(hlig_graph: HLIGGraph, outputs_dir: Path) -> None:
+    """
+    Extract interface_spec from HLIG edges and write to shared/interfaces.json.
+    Both Frontend and Backend can read this file during code generation.
+    """
+    by_edge: dict[str, dict] = {}
+    for u, v, data in hlig_graph.edges():
+        spec = data.get("interface_spec")
+        ref = data.get("interface_ref")
+        if spec and isinstance(spec, dict):
+            key = f"{u}→{v}"
+            by_edge[key] = {
+                "from": u,
+                "to": v,
+                "interface_type": data.get("interface_type", "dependency"),
+                **{k: v for k, v in spec.items() if k in ("type", "description", "endpoints", "schema", "ref")},
+            }
+        elif ref:
+            key = f"{u}→{v}"
+            by_edge[key] = {"from": u, "to": v, "interface_ref": ref, "interface_type": data.get("interface_type", "dependency")}
+    if not by_edge:
+        return
+    shared_dir = outputs_dir / "shared"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    out = {"by_edge": by_edge}
+    (shared_dir / "interfaces.json").write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
 
 
 class DTGArtifactGenerator:
@@ -87,18 +203,29 @@ class DTGArtifactGenerator:
             return path.read_text()
         return ""
 
-    def _call_llm(self, prompt: str, input_data: dict, session_id: str = "") -> str:
+    def _call_llm(self, prompt: str, input_data: dict, session_id: str = "", agent_name: str = "artifact_gen") -> str:
         try:
             from core.model_manager import ModelManager
+            from core.debug_logger import log_llm_call
         except ImportError:
             return ""
 
         try:
             mm = ModelManager()
-            full_prompt = f"{prompt.strip()}\n\n## Input\n\n```json\n{json.dumps(input_data, indent=2, default=str)}\n```"
-            return mm.generate_text(full_prompt)
+            variable_input = json.dumps(input_data, indent=2, default=str)
+            full_prompt = f"{prompt.strip()}\n\n## Input\n\n```json\n{variable_input}\n```"
+            text, usage = mm.generate_text(full_prompt)
+            if session_id:
+                log_llm_call(
+                    session_id, agent_name, full_prompt, text,
+                    usage=usage._asdict() if usage else None,
+                    variable_input=variable_input,
+                )
+            return text
         except Exception as e:
             log_pipeline_event(session_id, "artifact_generation_error", {"error": str(e)})
+            if isinstance(e, CostLimitExceeded):
+                raise
             return ""
 
     def _generate_design_doc(
@@ -108,24 +235,36 @@ class DTGArtifactGenerator:
         session_id: str,
         causal_path: list[dict] | None = None,
         causal_parent_context: dict[str, str] | None = None,
+        interface_definitions: list[dict] | None = None,
     ) -> str:
         """
-        Generate design document markdown for a DTG design node.
-        CVP: causal_path and causal_parent_context restrict/annotate context (Markov blanket).
+        Generate canonical design spec (JSON) for a DTG design node.
+        Output is for LLM consumption (code/test generation). CVP: causal_path and causal_parent_context.
         """
         prompt = self._load_prompt("design_doc_generator")
         if not prompt:
             return ""
 
         input_data = {
-            "dtg_node": {k: v for k, v in node.items() if k not in ("parent_hlig",)},
+            "dtg_node": {k: v for k, v in node.items()},
             "dependency_context": dependency_context,
         }
         if causal_path:
             input_data["causal_path"] = causal_path
         if causal_parent_context:
             input_data["causal_parent_context"] = causal_parent_context
-        return self._call_llm(prompt, input_data, session_id).strip()
+        if interface_definitions:
+            input_data["interface_definitions"] = interface_definitions
+        raw = self._call_llm(prompt, input_data, session_id).strip()
+        # Parse and re-serialize to ensure valid JSON; fallback to raw if parse fails
+        try:
+            from core.json_parser import parse_llm_json
+            parsed = parse_llm_json(raw)
+            if isinstance(parsed, dict) and parsed.get("type") == "design_spec":
+                return json.dumps(parsed, indent=2, default=str)
+        except Exception:
+            pass
+        return raw
 
     def _generate_code(
         self,
@@ -135,6 +274,7 @@ class DTGArtifactGenerator:
         session_id: str,
         causal_path: list[dict] | None = None,
         causal_parent_context: dict[str, str] | None = None,
+        interface_definitions: list[dict] | None = None,
     ) -> dict[str, str]:
         """
         Generate code files for a DTG code node. Returns {path: content}.
@@ -145,7 +285,7 @@ class DTGArtifactGenerator:
             return {}
 
         input_data = {
-            "dtg_node": {k: v for k, v in node.items() if k not in ("parent_hlig",)},
+            "dtg_node": {k: v for k, v in node.items()},
             "framework": framework,
             "dependency_context": dependency_context,
         }
@@ -153,6 +293,8 @@ class DTGArtifactGenerator:
             input_data["causal_path"] = causal_path
         if causal_parent_context:
             input_data["causal_parent_context"] = causal_parent_context
+        if interface_definitions:
+            input_data["interface_definitions"] = interface_definitions
         response = self._call_llm(prompt, input_data, session_id)
 
         try:
@@ -308,6 +450,7 @@ edition = "2021"
 
         framework = _infer_framework(hlig_node)
         order = _topological_order(dtg)
+        nodes_by_id = {n["id"]: n for n in order if n.get("id")}
         resolved: dict[str, str] = {}
         generated: list[str] = []
 
@@ -319,35 +462,214 @@ edition = "2021"
             task_type = (node.get("task_type") or "").lower()
             deps = node.get("dependencies") or []
             # CVP: dependency_context is DTG-level; causal_parent_context is HLIG-level (Markov blanket)
-            dep_ctx = {dep: resolved.get(dep, "") for dep in deps if resolved.get(dep)}
+            # Canonical formats: design_spec, code_output, or dtg_node_ref (when design spec missing)
+            dep_ctx = _build_dep_ctx(deps, resolved, nodes_by_id)
 
             if task_type in ("design", "documentation"):
+                iface_defs = _get_interfaces_for_hlig(hlig_graph, hlig_id) if hlig_graph else None
                 doc = self._generate_design_doc(
-                    node, dep_ctx, session_id, causal_path=causal_path, causal_parent_context=causal_parent_context
+                    node, dep_ctx, session_id, causal_path=causal_path, causal_parent_context=causal_parent_context,
+                    interface_definitions=iface_defs,
                 )
                 if doc:
                     safe_name = _safe_filename(node.get("title", nid))
-                    fp = designs_dir / f"{nid}_{safe_name}.md"
+                    fp = designs_dir / f"{nid}_{safe_name}.json"
                     fp.write_text(doc, encoding="utf-8")
-                    resolved[nid] = doc[:2000]  # truncate for context
+                    resolved[nid] = _truncate_design(doc)
                     generated.append(f"designs/{fp.name}")
                 log_pipeline_event(session_id, "design_generated", {"node": nid})
 
             elif task_type in ("code", "integration", "test", "build", "verification"):
+                iface_defs = _get_interfaces_for_hlig(hlig_graph, hlig_id) if hlig_graph else None
                 files = self._generate_code(
-                    node, framework, dep_ctx, session_id, causal_path=causal_path, causal_parent_context=causal_parent_context
+                    node, framework, dep_ctx, session_id, causal_path=causal_path, causal_parent_context=causal_parent_context,
+                    interface_definitions=iface_defs,
                 )
                 for rel_path, content in files.items():
                     full_path = hlig_dir / rel_path
                     full_path.parent.mkdir(parents=True, exist_ok=True)
                     full_path.write_text(content, encoding="utf-8")
-                    resolved[nid] = resolved.get(nid, "") + f"\n--- {rel_path} ---\n{content[:1500]}"
                     generated.append(rel_path)
                 if files:
+                    resolved[nid] = _make_code_output_spec(nid, list(files.items()))
                     log_pipeline_event(session_id, "code_generated", {"node": nid, "files": list(files.keys())})
 
         self._write_readme(hlig_dir, hlig_node, framework, generated)
         return hlig_dir
+
+    def _load_existing_design_docs(self, designs_dir: Path) -> dict[str, str]:
+        """Load design spec content from designs_dir for dependency context. Returns {node_id: content}.
+        Loads .json (canonical design_spec) first; falls back to .md for backward compatibility."""
+        resolved: dict[str, str] = {}
+        if not designs_dir.exists():
+            return resolved
+        # Prefer .json (canonical design_spec for LLM consumption)
+        for fp in designs_dir.glob("*.json"):
+            stem = fp.stem
+            if "_" in stem:
+                nid = stem.split("_", 1)[0]
+            else:
+                nid = stem
+            try:
+                resolved[nid] = _truncate_design(fp.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        # Fallback: legacy .md (for backward compatibility)
+        for fp in designs_dir.glob("*.md"):
+            stem = fp.stem
+            if "_" in stem:
+                nid = stem.split("_", 1)[0]
+            else:
+                nid = stem
+            if nid not in resolved:
+                try:
+                    resolved[nid] = _truncate_design(fp.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+        return resolved
+
+    def generate_design_docs_only(
+        self,
+        hlig_graph: HLIGGraph,
+        session_id: str,
+        date_dir: Path,
+    ) -> Path | None:
+        """
+        Generate only design documents for design-type DTG nodes.
+        Creates outputs_{session_id}/ under date_dir. Returns the outputs directory path.
+        """
+        outputs_dir = date_dir / f"outputs_{session_id}"
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        _write_interface_definitions(hlig_graph, outputs_dir)
+        topo_order = hlig_graph.topological_order()
+        node_data_by_id = {nid: dict(data) for nid, data in hlig_graph.nodes()}
+        hlig_outputs: dict[str, str] = {}
+
+        for nid in topo_order:
+            data = node_data_by_id.get(nid, {})
+            dtg = data.get("dtg")
+            if not isinstance(dtg, DTGGraph):
+                continue
+            hlig_node = {"id": nid, **{k: v for k, v in data.items() if k != "dtg" and not callable(v)}}
+            causal_parent_ids = hlig_graph.get_causal_parents(nid)
+            causal_parent_context = {pid: hlig_outputs.get(pid, "") for pid in causal_parent_ids if pid in hlig_outputs}
+
+            try:
+                hlig_dir = outputs_dir / nid
+                hlig_dir.mkdir(parents=True, exist_ok=True)
+                designs_dir = hlig_dir / "designs"
+                designs_dir.mkdir(exist_ok=True)
+                causal_path: list[dict] = []
+                if hasattr(hlig_graph, "get_causal_path"):
+                    path_tuples = hlig_graph.get_causal_path(nid)
+                    causal_path = [
+                        {"id": nid2, "task": d.get("task", ""), "outputs": d.get("outputs", [])}
+                        for nid2, d in path_tuples
+                    ]
+                    self._write_causal_path_metadata(hlig_dir, causal_path)
+                order = _topological_order(dtg)
+                resolved: dict[str, str] = {}
+                for node in order:
+                    task_type = (node.get("task_type") or "").lower()
+                    if task_type not in ("design", "documentation"):
+                        continue
+                    nid2 = node.get("id", "")
+                    deps = node.get("dependencies") or []
+                    dep_ctx = {d: resolved.get(d, "") for d in deps if resolved.get(d)}
+                    doc = self._generate_design_doc(
+                        node, dep_ctx, session_id,
+                        causal_path=causal_path,
+                        causal_parent_context=causal_parent_context if causal_parent_context else None,
+                        interface_definitions=_get_interfaces_for_hlig(hlig_graph, nid),
+                    )
+                    if doc:
+                        safe_name = _safe_filename(node.get("title", nid2))
+                        fp = designs_dir / f"{nid2}_{safe_name}.json"
+                        fp.write_text(doc, encoding="utf-8")
+                        resolved[nid2] = _truncate_design(doc)
+                    log_pipeline_event(session_id, "design_generated", {"node": nid2})
+                task = hlig_node.get("task", "")
+                hlig_outputs[nid] = f"[{nid}] {task}\n(design docs generated)"
+            except Exception as e:
+                log_pipeline_event(session_id, "artifact_generation_error", {"hlig": nid, "error": str(e)})
+                if isinstance(e, CostLimitExceeded):
+                    raise
+
+        return outputs_dir
+
+    def generate_code_only(
+        self,
+        hlig_graph: HLIGGraph,
+        session_id: str,
+        outputs_dir: Path,
+    ) -> Path | None:
+        """
+        Generate only code for code-type DTG nodes.
+        Reads design spec from designs/ when present; for missing design deps (e.g. hlig_no_design_docs),
+        injects dtg_node_ref from DTG metadata. All dependency_context uses canonical JSON formats.
+        """
+        topo_order = hlig_graph.topological_order()
+        node_data_by_id = {nid: dict(data) for nid, data in hlig_graph.nodes()}
+        hlig_outputs: dict[str, str] = {}
+
+        for nid in topo_order:
+            data = node_data_by_id.get(nid, {})
+            dtg = data.get("dtg")
+            if not isinstance(dtg, DTGGraph):
+                continue
+            hlig_node = {"id": nid, **{k: v for k, v in data.items() if k != "dtg" and not callable(v)}}
+            hlig_dir = outputs_dir / nid
+            causal_parent_ids = hlig_graph.get_causal_parents(nid)
+            causal_parent_context = {pid: hlig_outputs.get(pid, "") for pid in causal_parent_ids if pid in hlig_outputs}
+
+            try:
+                framework = _infer_framework(hlig_node)
+                designs_dir = hlig_dir / "designs"
+                resolved = self._load_existing_design_docs(designs_dir)
+                order = _topological_order(dtg)
+                nodes_by_id = {n["id"]: n for n in order if n.get("id")}
+                generated: list[str] = []
+                for node in order:
+                    task_type = (node.get("task_type") or "").lower()
+                    if task_type not in ("code", "integration", "test", "build", "verification"):
+                        continue
+                    nid2 = node.get("id", "")
+                    deps = node.get("dependencies") or []
+                    dep_ctx = _build_dep_ctx(deps, resolved, nodes_by_id)
+                    causal_path: list[dict] = []
+                    if hasattr(hlig_graph, "get_causal_path"):
+                        path_tuples = hlig_graph.get_causal_path(nid)
+                        causal_path = [
+                            {"id": nid3, "task": d.get("task", ""), "outputs": d.get("outputs", [])}
+                            for nid3, d in path_tuples
+                        ]
+                    files = self._generate_code(
+                        node, framework, dep_ctx, session_id,
+                        causal_path=causal_path,
+                        causal_parent_context=causal_parent_context if causal_parent_context else None,
+                        interface_definitions=_get_interfaces_for_hlig(hlig_graph, nid),
+                    )
+                    for rel_path, content in files.items():
+                        full_path = hlig_dir / rel_path
+                        full_path.parent.mkdir(parents=True, exist_ok=True)
+                        full_path.write_text(content, encoding="utf-8")
+                        generated.append(rel_path)
+                    if files:
+                        resolved[nid2] = _make_code_output_spec(nid2, list(files.items()))
+                        log_pipeline_event(session_id, "code_generated", {"node": nid2, "files": list(files.keys())})
+                self._scaffold_project(hlig_dir, framework, hlig_node)
+                existing = [f.name for f in ((list(designs_dir.glob("*.json")) + list(designs_dir.glob("*.md"))) if designs_dir.exists() else [])]
+                self._write_readme(hlig_dir, hlig_node, framework, generated + [f"designs/{x}" for x in existing])
+                task = hlig_node.get("task", "")
+                readme = hlig_dir / "README.md"
+                summary = readme.read_text(encoding="utf-8")[:3000] if readme.exists() else ""
+                hlig_outputs[nid] = f"[{nid}] {task}\n{summary}"
+            except Exception as e:
+                log_pipeline_event(session_id, "artifact_generation_error", {"hlig": nid, "error": str(e)})
+                if isinstance(e, CostLimitExceeded):
+                    raise
+
+        return outputs_dir
 
     def generate_all(
         self,
@@ -364,6 +686,7 @@ edition = "2021"
         """
         outputs_dir = date_dir / f"outputs_{session_id}"
         outputs_dir.mkdir(parents=True, exist_ok=True)
+        _write_interface_definitions(hlig_graph, outputs_dir)
 
         # CVP: Process in topological order so parent outputs are available for Markov blanket
         topo_order = hlig_graph.topological_order()
@@ -397,5 +720,7 @@ edition = "2021"
                     hlig_outputs[nid] = f"[{nid}] {task}\n{summary}"
             except Exception as e:
                 log_pipeline_event(session_id, "artifact_generation_error", {"hlig": nid, "error": str(e)})
+                if isinstance(e, CostLimitExceeded):
+                    raise
 
         return outputs_dir

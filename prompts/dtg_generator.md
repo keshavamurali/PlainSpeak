@@ -26,11 +26,17 @@ You will receive exactly one HLIG node in this structure (from the Planner):
   "task": "<high-level subsystem task description>",
   "inputs": ["<inputs to this subsystem>"],
   "outputs": ["<outputs from this subsystem>"],
-  "language": "<preferred language or TBD>",
+  "language": "<preferred language; default: Rust, Tauri, React, CSS>",
   "external_interfaces": ["API", "DB", "Filesystem", "Auth", "None"],
-  "dtg_root": "DTG-X"
+  "dtg_root": "DTG-X",
+  "max_design_nodes": 4,
+  "max_code_nodes": 8
 }
 ```
+
+**Optional cost-optimization fields** (when provided, limit node count):
+- `max_design_nodes`: Maximum number of design/documentation-type nodes. Prefer combining related subtasks.
+- `max_code_nodes`: Maximum number of code/test/integration-type nodes. Prefer coarser, combined nodes.
 
 ---
 
@@ -76,7 +82,7 @@ Each node in `nodes` must follow:
 **Runtime enrichment (added after generation):** Each DTG node is enriched with `parent_hlig` and `language` so it is self-contained for independent agent execution. Consumers receive:
 
 - `parent_hlig`: `{ id, task, inputs, outputs, language, external_interfaces }` from the parent HLIG node
-- `language`: Preferred language/framework (e.g. Python, JavaScript, TBD)
+- `language`: Preferred language/framework (default: Rust, Tauri, React, CSS)
 
 Use these when passing a DTG node to an LLM for design docs or code generation.
 
@@ -91,12 +97,18 @@ Each edge in `edges` must follow:
   "from": "DTG-X-A",
   "to": "DTG-X-B",
   "dependency_type": "strict | soft | data-flow",
-  "description": "Reason for dependency"
+  "description": "Reason for dependency",
+  "data_spec": {
+    "output_ref": "Reference to outputs_produced of source",
+    "input_ref": "Reference to inputs_required of target",
+    "schema": {}
+  }
 }
 ```
 
 - If B cannot start until A finishes → edge A → B.
 - Edges define ordering and dependency constraints only.
+- **data-flow edges:** When `dependency_type` is `data-flow`, include `data_spec` to define the contract: `output_ref` (which output of source flows), `input_ref` (which input of target receives it), and optional `schema` (data shape). This ensures the data contract is explicit for code generation.
 
 ---
 
@@ -106,16 +118,26 @@ Each edge in `edges` must follow:
    Extract task, inputs, outputs, external interfaces. Infer acceptance criteria from the task and outputs.
 
 2. **Identify subtasks**  
-   Break into: design, data modeling, interface definition, core implementation, error handling, unit tests, integration, validation, documentation, build/review.
+   Break into: design, data modeling, interface definition, core implementation, error handling, unit tests, integration, validation, documentation, build/review. **Backend/data subsystems:** If the HLIG node has `external_interfaces` including `API`, `DB`, or similar, you MUST include at least one `task_type: "test"` node (unit tests), at least one `task_type: "integration"` or `task_type: "verification"` node, and edges from implementation nodes to these test nodes. Backend subsystems must never omit testing.
 
 3. **Create DTG nodes**  
-   One node per subtask. Use the mandatory schema. Keep nodes atomic and execution-ready.
+   One node per subtask. Use the mandatory schema. Keep nodes atomic and execution-ready. If `max_design_nodes` or `max_code_nodes` are provided in the input, do not exceed them—combine related subtasks into fewer, coarser nodes.
+   **Node limits (cost optimization):** If the input includes `max_design_nodes` or `max_code_nodes`, limit the number of nodes accordingly. Count design-type nodes (task_type: design, documentation) separately from code-type nodes (task_type: code, test, integration, build, verification). Prefer combining related subtasks into fewer, coarser nodes when limits apply.
 
 4. **Connect with edges**  
    Map ordering: design → code → test → integration, etc. Ensure no cycles.
 
 5. **Validate**  
    DTG must be acyclic, connected, with no orphan nodes. Aligned with HLIG acceptance criteria.
+
+---
+
+## NODE LIMITS (cost optimization)
+
+If the input includes `max_design_nodes` and/or `max_code_nodes`, limit the DTG accordingly:
+- `max_design_nodes`: Maximum number of nodes with `task_type` in (design, documentation). Prefer combining related design subtasks.
+- `max_code_nodes`: Maximum number of nodes with `task_type` in (code, integration, test, build, verification). Prefer combining related implementation subtasks.
+- Still include at least one test node for backend subsystems. Stay minimal but complete.
 
 ---
 

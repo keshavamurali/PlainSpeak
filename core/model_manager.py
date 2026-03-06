@@ -4,6 +4,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 try:
     from dotenv import load_dotenv
@@ -13,6 +14,19 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_JSON = PROJECT_ROOT / "config" / "models.json"
+
+# Pricing per 1M tokens (USD). Source: https://ai.google.dev/gemini-api/docs/pricing (as of 2025)
+GEMINI_25_FLASH_PRICING = {"input": 0.30, "output": 2.50}  # $/1M tokens
+GEMINI_25_PRO_PRICING = {"input": 1.25, "output": 10.00}
+
+
+class LLMUsage(NamedTuple):
+    """Token usage and cost for an LLM call."""
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_usd: float
+    model: str
 
 
 def _load_models_config() -> dict:
@@ -122,15 +136,45 @@ class ModelManager:
             t.sleep(4.5 - elapsed)
         ModelManager._last_call = time.time()
 
-    def generate_text(self, prompt: str) -> str:
-        """Generate text from prompt. Sync API."""
+    def _cost_for_model(self, input_tokens: int, output_tokens: int) -> float:
+        """Compute cost in USD from token counts. Ollama/local = 0."""
+        if self.model_type != "gemini":
+            return 0.0
+        model = self.model_info.get("model", "")
+        if "flash" in model.lower():
+            pricing = GEMINI_25_FLASH_PRICING
+        else:
+            pricing = GEMINI_25_PRO_PRICING
+        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
+        return round(input_cost + output_cost, 6)
+
+    def generate_text(self, prompt: str) -> tuple[str, LLMUsage | None]:
+        """
+        Generate text from prompt. Sync API.
+        Returns (text, usage). usage is None if unavailable.
+        """
+        usage: LLMUsage | None = None
+        text = ""
+
         if self.model_type == "gemini":
             self._wait_for_rate_limit()
             response = self.client.models.generate_content(
                 model=self.model_info["model"],
                 contents=prompt,
             )
-            return response.text.strip()
+            text = response.text.strip() if response.text else ""
+            meta = getattr(response, "usage_metadata", None)
+            if meta:
+                inp = getattr(meta, "prompt_token_count", 0) or 0
+                out = getattr(meta, "candidates_token_count", 0) or 0
+                usage = LLMUsage(
+                    input_tokens=inp,
+                    output_tokens=out,
+                    total_tokens=inp + out,
+                    cost_usd=self._cost_for_model(inp, out),
+                    model=str(self.model_info.get("model", "gemini")),
+                )
 
         elif self.model_type == "ollama":
             import urllib.request
@@ -144,6 +188,18 @@ class ModelManager:
             )
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.load(resp)
-            return result.get("response", "").strip()
+            text = result.get("response", "").strip()
+            inp = int(result.get("prompt_eval_count", 0) or 0)
+            out = int(result.get("eval_count", 0) or 0)
+            usage = LLMUsage(
+                input_tokens=inp,
+                output_tokens=out,
+                total_tokens=inp + out,
+                cost_usd=0.0,
+                model=str(self.model_info.get("model", "ollama")),
+            )
 
-        raise NotImplementedError(f"Unsupported model type: {self.model_type}")
+        else:
+            raise NotImplementedError(f"Unsupported model type: {self.model_type}")
+
+        return (text, usage)

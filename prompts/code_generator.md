@@ -8,11 +8,32 @@ You will receive:
 - A DTG node: `id`, `title`, `description`, `task_type`, `inputs_required`, `outputs_produced`, `success_criteria`
 - `parent_hlig`: parent HLIG context
 - `framework`: one of `node-react` (Node.js + React) or `rust-tauri` (Rust + Tauri)
-- `dependency_context`: Content or paths from prior DTG nodes this task depends on (design docs, code modules)
+- `dependency_context`: Map of DTG node ID → content. All values are **canonical JSON** for LLM consumption.
+
+**dependency_context value types** (parse JSON; check `type` field):
+
+1. **design_spec** (`"type": "design_spec"`): Full design spec from design nodes.
+   - `architecture`: `{components, data_flow, key_decisions}` — use for structure
+   - `implementation_instructions`: Array of concrete steps — **follow in order** when generating code
+   - `constraints`: Must-follow rules (e.g., "Use reqwest for HTTP")
+   - `outputs`: What this design produces — align your code with these
+   - `interface_refs`: References to API/DB contracts — use with `interface_definitions`
+
+2. **code_output** (`"type": "code_output"`): Prior code node output (e.g. when this task depends on another code task).
+   - `node_id`: DTG node that produced this code
+   - `files`: `[{path, content_preview}]` — use for integration; content_preview may be truncated
+
+3. **dtg_node_ref** (`"type": "dtg_node_ref"`): Design dep when design spec is missing (e.g. `hlig_no_design_docs` pipeline).
+   - `node_id`, `title`, `description`, `inputs_required`, `outputs_produced`, `success_criteria`
+   - Use as lightweight context when full design_spec was not generated
+
+Parse the JSON and follow `implementation_instructions` from design_spec when present. Treat all formats as canonical LLM instructions.
 
 **CVP (Causal Visual Programming):**
 - `causal_path`: Ordered list of HLIG nodes that led to this one (traceability). Each has `id`, `task`, `outputs`.
 - `causal_parent_context`: Output summaries from causal parent HLIG nodes only (Markov blanket). Use when present; prefer over unrelated context.
+
+**Interface contracts:** When `interface_definitions` is provided (from shared/interfaces.json), it contains the API/DB/message contracts between HLIG subsystems. When implementing API servers or clients, follow the endpoints and schemas defined there. Both Frontend and Backend read the same contract.
 
 ## Framework Guidelines
 

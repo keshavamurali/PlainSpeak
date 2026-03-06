@@ -12,6 +12,46 @@ from typing import Any
 
 import networkx as nx
 
+try:
+    from networkx.exception import NetworkXUnfeasible
+except ImportError:
+    NetworkXUnfeasible = type("NetworkXUnfeasible", (Exception,), {})
+
+
+class GraphCycleError(Exception):
+    """Raised when an HLIG or DTG graph contains a cycle. Used to retrigger planner/designer."""
+
+    def __init__(self, graph_type: str, cycle_edges: list, message: str = "", hlig_node_id: str | None = None):
+        self.graph_type = graph_type
+        self.cycle_edges = cycle_edges
+        self.hlig_node_id = hlig_node_id
+        msg = message or (
+            f"{graph_type} graph contains a cycle. "
+            f"Cycle edges: {cycle_edges}. "
+            "Dependencies must form a DAG (no cycles)."
+        )
+        super().__init__(msg)
+
+
+def _raise_if_cycle(
+    g: nx.DiGraph,
+    graph_label: str,
+    hlig_node_id: str | None = None,
+) -> None:
+    """Raise GraphCycleError if the directed graph contains a cycle."""
+    if not nx.is_directed_acyclic_graph(g):
+        try:
+            cycle_edges = list(nx.find_cycle(g))
+            # Prefer edge list as (u, v) for clarity
+            cycle_repr = [f"{u} -> {v}" for u, v in cycle_edges]
+        except Exception:
+            cycle_repr = ["(cycle detected but could not enumerate)"]
+        raise GraphCycleError(
+            graph_label,
+            cycle_repr,
+            hlig_node_id=hlig_node_id,
+        )
+
 
 def _safe_serialize(obj: Any) -> Any:
     """Convert object for JSON (handle non-JSON types)."""
@@ -63,10 +103,10 @@ class DTGGraph:
                 "task": hlig_node.get("task"),
                 "inputs": hlig_node.get("inputs", []),
                 "outputs": hlig_node.get("outputs", []),
-                "language": hlig_node.get("language", "TBD"),
+                "language": hlig_node.get("language", "Rust, Tauri, React, CSS"),
                 "external_interfaces": hlig_node.get("external_interfaces", []),
             }
-            lang = hlig_node.get("language", "TBD")
+            lang = hlig_node.get("language", "Rust, Tauri, React, CSS")
             for n in nodes:
                 if isinstance(n, dict) and "parent_hlig" not in n:
                     n["parent_hlig"] = parent_hlig
@@ -89,7 +129,9 @@ class DTGGraph:
         hlig_id = data.get("hlig_node_id", "")
         nodes = data.get("nodes", [])
         edges = data.get("edges", [])
-        return cls(hlig_id, nodes=nodes, edges=edges)
+        inst = cls(hlig_id, nodes=nodes, edges=edges)
+        _raise_if_cycle(inst._g, "DTG", hlig_node_id=hlig_id)
+        return inst
 
 
 class HLIGGraph:
@@ -146,7 +188,7 @@ class HLIGGraph:
         try:
             order = list(nx.topological_sort(self._g))
             ordered = [(nid, dict(self._g.nodes[nid])) for nid in order if nid in ancestors]
-        except nx.NetworkXError:
+        except (nx.NetworkXError, NetworkXUnfeasible):
             ordered = [(nid, dict(self._g.nodes[nid])) for nid in ancestors]
         return ordered
 
@@ -154,7 +196,7 @@ class HLIGGraph:
         """Return HLIG node IDs in topological order (parents before children)."""
         try:
             return list(nx.topological_sort(self._g))
-        except nx.NetworkXError:
+        except (nx.NetworkXError, NetworkXUnfeasible):
             return list(self._g.nodes())
 
     def set_node_dtg(self, node_id: str, dtg: DTGGraph) -> None:
@@ -205,7 +247,7 @@ class HLIGGraph:
         edges_raw = hlig.get("edges", [])
         if not nodes:
             return None
-        # Parse edges with CVP causal semantics (causal=true denotes direct causation)
+        # Parse edges with CVP causal semantics and interface contracts
         edges = []
         for e in edges_raw:
             if not e.get("from") or not e.get("to"):
@@ -215,5 +257,11 @@ class HLIGGraph:
                 # CVP: causal defaults to True when omitted (backward compat)
                 "causal": e.get("causal", True) if "causal" in e else True,
             }
+            if e.get("interface_spec"):
+                edge_attrs["interface_spec"] = e["interface_spec"]
+            if e.get("interface_ref"):
+                edge_attrs["interface_ref"] = e["interface_ref"]
             edges.append({"from": e["from"], "to": e["to"], **edge_attrs})
-        return cls(nodes=nodes, edges=edges)
+        inst = cls(nodes=nodes, edges=edges)
+        _raise_if_cycle(inst._g, "HLIG")
+        return inst

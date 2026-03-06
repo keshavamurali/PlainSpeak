@@ -103,7 +103,7 @@ An **HLIG** is a directed graph whose nodes represent **subsystems** of a softwa
 | `task` | string | Yes | High-level subsystem task description |
 | `inputs` | array of string | Yes | List of inputs to this subsystem |
 | `outputs` | array of string | Yes | List of outputs from this subsystem |
-| `language` | string | No | Preferred implementation language (e.g., `"Python"`, `"TBD"`) |
+| `language` | string | No | Preferred implementation language (default: `"Rust, Tauri, React, CSS"`) |
 | `external_interfaces` | array of string | No | External systems this subsystem interacts with |
 | `dtg_root` | string | No | ID of the root of the corresponding DTG; pattern `DTG-{N}` |
 | `dtg` | object | No | Embedded DTG (see Section 4); present when DTG is generated |
@@ -253,7 +253,7 @@ When both `interface_spec` and `interface_ref` are present, `interface_spec` tak
         "task": "Serve the coffee shop's website content, including web pages, styles, scripts, and media.",
         "inputs": ["HTTP Requests from Web Browser"],
         "outputs": ["Web Page Content (HTML, CSS, JS, Images)"],
-        "language": "TBD",
+        "language": "Rust, Tauri, React, CSS",
         "external_interfaces": ["Filesystem"],
         "dtg_root": "DTG-1"
       },
@@ -262,7 +262,7 @@ When both `interface_spec` and `interface_ref` are present, `interface_spec` tak
         "task": "Process and fulfill coffee orders via an API.",
         "inputs": ["Order requests from frontend"],
         "outputs": ["Order confirmation", "Inventory updates"],
-        "language": "TBD",
+        "language": "Rust, Tauri, React, CSS",
         "external_interfaces": ["API", "DB"],
         "dtg_root": "DTG-2"
       }
@@ -386,6 +386,7 @@ Implementations may extend `execution_spec` with vendor-specific fields under a 
 | `to` | string | Yes | Target node ID (alias: `target`) |
 | `dependency_type` | string | No | Semantics of the dependency |
 | `description` | string | No | Human-readable reason for the dependency |
+| `data_spec` | object | No | For `data-flow`: contract defining what flows (see 4.5.1) |
 
 **Dependency Types (`dependency_type`):**
 
@@ -406,10 +407,10 @@ When a DTG is consumed by an agent, each node MAY be enriched with `parent_hlig`
     "task": "...",
     "inputs": ["..."],
     "outputs": ["..."],
-    "language": "TBD",
+    "language": "Rust, Tauri, React, CSS",
     "external_interfaces": ["Filesystem"]
   },
-  "language": "TBD"
+  "language": "Rust, Tauri, React, CSS"
 }
 ```
 

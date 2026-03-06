@@ -88,7 +88,7 @@ class BaseAgent:
                 count=1,
                 flags=re.DOTALL,
             )
-        elif self.name in ("dtg_generator", "designer"):
+        elif self.name == "designer":
             writes_hint = "\n\nYour output must be valid JSON with keys: hlig_node_id, nodes, edges."
             full_prompt = f"{prompt_text.strip()}{writes_hint}\n\n## HLIG Node (input)\n\n```json\n{json.dumps(input_data, indent=2)}\n```"
         else:
@@ -98,8 +98,18 @@ class BaseAgent:
             full_prompt = f"{prompt_text.strip()}{writes_hint}\n\n```json\n{json.dumps(input_data, indent=2)}\n```"
 
         try:
-            response = model_manager.generate_text(full_prompt)
-            log_llm_call(session_id, self.name, full_prompt, response)
+            response_text, usage = model_manager.generate_text(full_prompt)
+            usage_dict = usage._asdict() if usage else None
+            # Log only variable input (not prompt template from .md) to keep debug logs smaller
+            if self.name == "planner":
+                variable_input = block_content
+            else:
+                variable_input = json.dumps(input_data, indent=2)
+            log_llm_call(
+                session_id, self.name, full_prompt, response_text,
+                usage=usage_dict, variable_input=variable_input,
+            )
+            response = response_text
         except Exception as e:
             return {"_error": str(e)}
 
@@ -115,7 +125,7 @@ class BaseAgent:
         """
         Execute the agent with the current prompt.
         Uses LLM when configured; falls back to placeholder if not.
-        If input_override is provided, use it instead of building from ctx (for dtg_generator, etc.).
+        If input_override is provided, use it instead of building from ctx (for designer, etc.).
         """
         prompt_text = self._load_prompt()
         input_data = input_override if input_override is not None else self._build_input_data(ctx)

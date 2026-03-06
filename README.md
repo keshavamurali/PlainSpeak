@@ -68,6 +68,28 @@ The default pipeline runs 9 agents in order:
 
 Set `default_pipeline: default` in `agents/config/agents.yaml` to use the shorter pipeline (planner, clarification, coder, reviewer).
 
+## Design Specs (LLM-Oriented)
+
+Design nodes produce **canonical design specifications** in JSON format for LLM consumption (not human documentation). Stored as `designs/DTG-X-Y_Title.json` with schema:
+
+- `type`: `"design_spec"`
+- `architecture`: components, data_flow, key_decisions
+- `implementation_instructions`: ordered, concrete steps for code-generating LLMs
+- `constraints`, `outputs`, `dependencies`
+
+Downstream agents (code generator, test generator) parse this JSON and follow the instructions precisely.
+
+## Cost Optimizations
+
+To reduce LLM cost (especially with Gemini):
+
+- **`hlig_no_design_docs` pipeline** — Skips design doc generation and design review (~50% fewer LLM calls). Set `default_pipeline: hlig_no_design_docs` or pass `pipeline: "hlig_no_design_docs"` when creating a run.
+- **Pipeline selection per run** — POST `/api/runs` accepts `{ "query": "...", "pipeline": "hlig_no_design_docs" }`. Omit `pipeline` to use the default.
+- **Coarser DTG** — In `agents/config/agents.yaml`, the designer step has `max_design_nodes: 4` and `max_code_nodes: 8` to limit DTG granularity (fewer nodes = fewer LLM calls).
+- **Context truncation** — Env vars `DESIGN_CONTEXT_MAX_CHARS` (default 2000) and `CODE_CONTEXT_MAX_CHARS` (default 1500) limit dependency context size. Use `0` for no truncation.
+- **Early exit on build failure** — If the builder phase fails, unit/integration/system testers are skipped to avoid wasted LLM calls.
+- **Cost limit** — `COST_LIMIT_USD` (default 0.25) stops the run when exceeded. Set to `0` to disable.
+
 ## CVP (Causal Visual Programming)
 
 PlainSpeak integrates causal semantics to reduce hallucinations and improve robustness:

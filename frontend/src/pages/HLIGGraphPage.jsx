@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactFlow, {
   useNodesState,
   useEdgesState,
@@ -539,24 +539,35 @@ function DTGSubGraph({ dtg }) {
 const nodeTypes = { graphNode: GraphNode, startNode: StartNode };
 const edgeTypes = { edgeWithLabel: EdgeWithLabel };
 
+/** Build runData from a graph JSON file (nodes + edges). Accepts raw HLIG or {hlig_graph: {...}} */
+function graphFileToRunData(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+  const hlig = parsed.hlig_graph || (parsed.nodes && parsed.edges ? parsed : null);
+  if (!hlig?.nodes?.length) return null;
+  return { hlig_graph: hlig, artifacts: {} };
+}
+
 function HLIGGraphInner({ runId, runData: initialRunData, onSelectRun }) {
   const [runData, setRunData] = useState(initialRunData);
   const [selectedNode, setSelectedNode] = useState(null);
   const [selectedEdge, setSelectedEdge] = useState(null);
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [fileMode, setFileMode] = useState(false);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     setRunData(initialRunData);
   }, [initialRunData]);
 
   useEffect(() => {
-    if (!runId) {
+    if (!runId && !fileMode) {
       setNodes([]);
       setEdges([]);
       setSelectedNode(null);
       return;
     }
+    if (fileMode) return; // file mode: runData set by file load
     const load = async () => {
       try {
         const d = await runs.get(runId);
@@ -566,7 +577,29 @@ function HLIGGraphInner({ runId, runData: initialRunData, onSelectRun }) {
       }
     };
     load();
-  }, [runId]);
+  }, [runId, fileMode]);
+
+  const onLoadFile = useCallback((e) => {
+    const file = e?.target?.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        const data = graphFileToRunData(parsed);
+        if (data) {
+          setRunData(data);
+          setFileMode(true);
+        } else {
+          alert("Invalid graph file. Expected {nodes, edges} or {hlig_graph: {nodes, edges}}");
+        }
+      } catch (err) {
+        alert("Failed to parse JSON: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }, []);
 
   useEffect(() => {
     const graph = getGraphData(runData);
@@ -634,20 +667,46 @@ function HLIGGraphInner({ runId, runData: initialRunData, onSelectRun }) {
   return (
     <main className="mx-auto max-w-6xl flex flex-col h-[calc(100vh-72px)] bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
       <div className="flex-shrink-0 px-4 py-3 border-b border-slate-200 bg-slate-50 flex flex-col gap-2">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <div>
             <h2 className="text-sm font-medium text-slate-700">HLIG Graph</h2>
-            {runId && (
+            {runId ? (
               <p className="text-xs text-slate-500 mt-0.5 truncate" title={runId}>
                 Run: {runId}
               </p>
+            ) : fileMode ? (
+              <p className="text-xs text-slate-500 mt-0.5">Loaded from file</p>
+            ) : (
+              <p className="text-sm text-slate-500">
+                Select a run or load a graph file
+              </p>
             )}
           </div>
-          {!runId && (
-            <p className="text-sm text-slate-500">
-              Select a run from the Runs tab to view its graph
-            </p>
-          )}
+          <div className="flex items-center gap-2 shrink-0">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json,application/json"
+              className="hidden"
+              onChange={onLoadFile}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="px-3 py-1.5 text-sm font-medium rounded-lg bg-violet-100 text-violet-700 hover:bg-violet-200 border border-violet-200"
+            >
+              Load from file
+            </button>
+            {fileMode && (
+              <button
+                type="button"
+                onClick={() => { setFileMode(false); setRunData(null); setNodes([]); setEdges([]); }}
+                className="px-3 py-1.5 text-sm font-medium rounded-lg bg-slate-200 text-slate-600 hover:bg-slate-300"
+              >
+                Clear
+              </button>
+            )}
+          </div>
         </div>
         {artifactOutputsPath && (
           <div className="flex items-center gap-2">
@@ -662,9 +721,9 @@ function HLIGGraphInner({ runId, runData: initialRunData, onSelectRun }) {
         )}
       </div>
 
-      {!runId ? (
+      {!runId && !fileMode ? (
         <div className="flex-1 flex items-center justify-center text-slate-500">
-          <p>No run selected. Go to Runs and open a run to see its HLIG graph.</p>
+          <p>Select a run from the Runs tab, or use &quot;Load from file&quot; to view a graph JSON file (e.g. graph_*.json).</p>
         </div>
       ) : !graph ? (
         <div className="flex-1 flex items-center justify-center text-slate-500">

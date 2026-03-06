@@ -9,10 +9,13 @@ from pydantic import BaseModel
 
 from shared.state import get_multi_mcp, active_sessions
 
+import sys
+
 try:
-    from core.debug_logger import log_pipeline_event
+    from core.debug_logger import log_pipeline_event, CostLimitExceeded
 except ImportError:
     log_pipeline_event = lambda *a, **kw: None
+    CostLimitExceeded = Exception  # noqa: type to satisfy isinstance
 from agents.runner import AgentRunner
 from context.execution_context import ExecutionContext
 from session.manager import SessionManager
@@ -24,6 +27,7 @@ session_manager = SessionManager()
 
 class RunRequest(BaseModel):
     query: str
+    pipeline: str | None = None  # e.g. "hlig_full", "hlig_no_design_docs" - uses default if omitted
 
 
 class InputRequest(BaseModel):
@@ -37,7 +41,7 @@ class RunResponse(BaseModel):
     query: str
 
 
-async def process_run(run_id: str, query: str) -> None:
+async def process_run(run_id: str, query: str, pipeline: str | None = None) -> None:
     """Background task: run agent pipeline and publish events."""
     loop = asyncio.get_running_loop()
     mcp = get_multi_mcp()
@@ -91,6 +95,7 @@ async def process_run(run_id: str, query: str) -> None:
         ctx = await asyncio.to_thread(
             runner.run,
             ctx=ctx,
+            pipeline=pipeline,
             event_loop=loop,
             on_step_complete=save_progress,
             wait_for_input=wait_for_input,
@@ -104,13 +109,16 @@ async def process_run(run_id: str, query: str) -> None:
         session_manager.save_session(run_id, data)
 
     except Exception as e:
-        log_pipeline_event(run_id, "run_failed", {"error": str(e)})
-        await event_bus.publish("run_failed", run_id, {"run_id": run_id, "error": str(e)})
+        err_msg = str(e)
+        log_pipeline_event(run_id, "run_failed", {"error": err_msg})
+        await event_bus.publish("run_failed", run_id, {"run_id": run_id, "error": err_msg})
         data = ctx.to_dict()
         data["status"] = "failed"
         data["query"] = query
-        data["error"] = str(e)
+        data["error"] = err_msg
         session_manager.save_session(run_id, data)
+        # Show error on command line when running server
+        print(f"\n[PlainSpeak] Run {run_id} FAILED: {err_msg}\n", file=sys.stderr, flush=True)
     finally:
         if run_id in active_sessions:
             del active_sessions[run_id]
@@ -252,10 +260,10 @@ def _enrich_hlig_graph(hlig_graph: dict) -> dict:
             "task": node.get("task"),
             "inputs": node.get("inputs", []),
             "outputs": node.get("outputs", []),
-            "language": node.get("language", "TBD"),
+            "language": node.get("language", "Rust, Tauri, React, CSS"),
             "external_interfaces": node.get("external_interfaces", []),
         }
-        lang = node.get("language", "TBD")
+        lang = node.get("language", "Rust, Tauri, React, CSS")
         for n in dtg.get("nodes", []):
             if isinstance(n, dict) and "parent_hlig" not in n:
                 n["parent_hlig"] = parent_hlig
@@ -296,7 +304,7 @@ async def create_run(req: RunRequest, background_tasks: BackgroundTasks):
     """Create a new run and start agent pipeline in background."""
     run_id = str(int(datetime.utcnow().timestamp() * 1000))[-10:]
     active_sessions[run_id] = {"status": "starting", "query": req.query}
-    background_tasks.add_task(process_run, run_id, req.query)
+    background_tasks.add_task(process_run, run_id, req.query, req.pipeline)
     return {
         "id": run_id,
         "status": "starting",
