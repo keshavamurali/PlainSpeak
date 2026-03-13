@@ -9,16 +9,20 @@ CVP (Causal Visual Programming) integration:
 import json
 import os
 import re
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from core.hlig_dtg_graphs import HLIGGraph, DTGGraph
 
 try:
-    from core.debug_logger import log_pipeline_event, CostLimitExceeded
+    from core.debug_logger import log_pipeline_event, CostLimitExceeded, check_cost_limit_before_llm, log_llm_input
 except ImportError:
     log_pipeline_event = lambda *a, **kw: None
     CostLimitExceeded = Exception  # noqa: type to satisfy isinstance
+    def check_cost_limit_before_llm(_session_id: str) -> None: ...
+    log_llm_input = lambda *a, **kw: None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -84,6 +88,75 @@ def _build_dep_ctx(deps: list[str], resolved: dict[str, str], nodes_by_id: dict[
     return result
 
 
+def _build_implementation_brief(
+    dependency_context: dict[str, str],
+    interface_definitions: list[dict] | None,
+    dtg_node: dict,
+    framework: str,
+) -> str:
+    """
+    Build a full LLM-oriented implementation brief from design/DTG context.
+    Gives the coder a single, clear prompt block: what to implement, interfaces, and compilability.
+    """
+    lines: list[str] = []
+    lines.append("## Implementation brief (follow this when generating code)")
+    lines.append("")
+    lines.append(f"**This task:** {dtg_node.get('title', '')} — {dtg_node.get('description', '')}")
+    lines.append("")
+    for dep_id, content in dependency_context.items():
+        if not content or not content.strip():
+            continue
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            lines.append(f"### Dependency {dep_id}")
+            lines.append(content[:2000] + ("..." if len(content) > 2000 else ""))
+            lines.append("")
+            continue
+        ptype = parsed.get("type", "")
+        if ptype == "design_spec":
+            lines.append(f"### Design spec ({dep_id})")
+            arch = parsed.get("architecture") or {}
+            if arch:
+                lines.append("**Architecture:** " + json.dumps(arch, indent=2, default=str))
+            instr = parsed.get("implementation_instructions") or []
+            if instr:
+                lines.append("**Implementation steps (follow in order):**")
+                for i, step in enumerate(instr, 1):
+                    lines.append(f"  {i}. {step}")
+            constraints = parsed.get("constraints") or []
+            if constraints:
+                lines.append("**Constraints:** " + "; ".join(constraints))
+            outputs = parsed.get("outputs") or []
+            if outputs:
+                lines.append("**Outputs to produce:** " + ", ".join(str(o) for o in outputs))
+            iface_refs = parsed.get("interface_refs") or []
+            if iface_refs:
+                lines.append("**Interface refs:** " + ", ".join(str(r) for r in iface_refs))
+            lines.append("")
+        elif ptype == "dtg_node_ref":
+            lines.append(f"### DTG ref ({dep_id}) — use when no full design spec")
+            lines.append(f"**Title:** {parsed.get('title', '')}")
+            lines.append(f"**Description:** {parsed.get('description', '')}")
+            for key in ("inputs_required", "outputs_produced", "success_criteria"):
+                val = parsed.get(key)
+                if val:
+                    lines.append(f"**{key}:** {json.dumps(val, default=str)}")
+            lines.append("")
+        # code_output: no need to repeat in brief; dependency_context already has it
+    if interface_definitions:
+        lines.append("### Required interfaces (APIs / contracts)")
+        lines.append("Implement and respect these contracts; both Frontend and Backend use the same definitions.")
+        lines.append(json.dumps(interface_definitions, indent=2, default=str))
+        lines.append("")
+    lines.append("### Compilation requirement")
+    if framework == "rust-tauri":
+        lines.append("Code must compile with `cargo build`. Use valid Rust 2021; all imports and types must resolve.")
+    else:
+        lines.append("Code must build with `npm run build`. Use valid JS/ES modules; all imports must resolve.")
+    return "\n".join(lines)
+
+
 # -----------------------------------------------------------------------------
 # CVP: Metadata key for causal path in generated artifacts (traceability)
 CAUSAL_PATH_FILE = "causal_path.json"
@@ -110,6 +183,67 @@ def _infer_framework(hlig_node: dict) -> str:
     if "API" in interfaces or "DB" in interfaces:
         return "rust-tauri"
     return "rust-tauri"  # default: Rust, Tauri, React, CSS
+
+
+def _run_local_build(hlig_dir: Path, framework: str, timeout_sec: int = 120) -> tuple[bool, str, str]:
+    """
+    Run a lightweight compile/build in hlig_dir. No MCP.
+    Returns (success, stdout, stderr).
+    """
+    if not hlig_dir.exists():
+        return False, "", "directory does not exist"
+    try:
+        if framework == "rust-tauri":
+            r = subprocess.run(
+                ["cargo", "build"],
+                cwd=str(hlig_dir),
+                capture_output=True,
+                timeout=timeout_sec,
+                text=True,
+            )
+            return r.returncode == 0, r.stdout or "", r.stderr or ""
+        # node-react
+        subprocess.run(
+            ["npm", "install"],
+            cwd=str(hlig_dir),
+            capture_output=True,
+            timeout=timeout_sec,
+            text=True,
+        )
+        r = subprocess.run(
+            ["npm", "run", "build"],
+            cwd=str(hlig_dir),
+            capture_output=True,
+            timeout=timeout_sec,
+            text=True,
+        )
+        return r.returncode == 0, r.stdout or "", r.stderr or ""
+    except subprocess.TimeoutExpired:
+        return False, "", "build timed out"
+    except FileNotFoundError:
+        return False, "", "cargo or npm not found"
+    except Exception as e:
+        return False, "", str(e)
+
+
+BUILD_LOG_FILE = "build.log"
+
+
+def _write_build_log(hlig_dir: Path, success: bool, stdout: str, stderr: str) -> None:
+    """Append build result and output to build.log in the HLIG code directory."""
+    log_path = hlig_dir / BUILD_LOG_FILE
+    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    status = "success" if success else "failure"
+    block = f"\n{'='*60}\n[{ts}] Build {status}\n{'='*60}\n"
+    if stdout:
+        block += f"--- stdout ---\n{stdout}\n"
+    if stderr:
+        block += f"--- stderr ---\n{stderr}\n"
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(block)
+    except Exception:
+        pass
 
 
 def _topological_order(dtg: DTGGraph) -> list[dict]:
@@ -204,6 +338,8 @@ class DTGArtifactGenerator:
         return ""
 
     def _call_llm(self, prompt: str, input_data: dict, session_id: str = "", agent_name: str = "artifact_gen") -> str:
+        check_cost_limit_before_llm(session_id)
+        log_llm_input(session_id, agent_name, input_data)
         try:
             from core.model_manager import ModelManager
             from core.debug_logger import log_llm_call
@@ -275,10 +411,15 @@ class DTGArtifactGenerator:
         causal_path: list[dict] | None = None,
         causal_parent_context: dict[str, str] | None = None,
         interface_definitions: list[dict] | None = None,
+        compile_errors: str | None = None,
+        design_docs_available: bool = True,
+        implementation_brief: str | None = None,
     ) -> dict[str, str]:
         """
         Generate code files for a DTG code node. Returns {path: content}.
         CVP: causal_path and causal_parent_context restrict/annotate context (Markov blanket).
+        When compile_errors is set, the model should fix the code to resolve the build output.
+        implementation_brief: full design-based prompt text for clarity; use when provided.
         """
         prompt = self._load_prompt("code_generator")
         if not prompt:
@@ -288,6 +429,7 @@ class DTGArtifactGenerator:
             "dtg_node": {k: v for k, v in node.items()},
             "framework": framework,
             "dependency_context": dependency_context,
+            "design_docs_available": design_docs_available,
         }
         if causal_path:
             input_data["causal_path"] = causal_path
@@ -295,6 +437,10 @@ class DTGArtifactGenerator:
             input_data["causal_parent_context"] = causal_parent_context
         if interface_definitions:
             input_data["interface_definitions"] = interface_definitions
+        if compile_errors:
+            input_data["compile_errors"] = compile_errors
+        if implementation_brief:
+            input_data["implementation_brief"] = implementation_brief
         response = self._call_llm(prompt, input_data, session_id)
 
         try:
@@ -452,49 +598,72 @@ edition = "2021"
         order = _topological_order(dtg)
         nodes_by_id = {n["id"]: n for n in order if n.get("id")}
         resolved: dict[str, str] = {}
-        generated: list[str] = []
+        generated_design: list[str] = []
 
         # Scaffold project structure so it's buildable
         self._scaffold_project(hlig_dir, framework, hlig_node)
 
+        # Design nodes run once
         for node in order:
             nid = node.get("id", "")
             task_type = (node.get("task_type") or "").lower()
+            if task_type not in ("design", "documentation"):
+                continue
             deps = node.get("dependencies") or []
-            # CVP: dependency_context is DTG-level; causal_parent_context is HLIG-level (Markov blanket)
-            # Canonical formats: design_spec, code_output, or dtg_node_ref (when design spec missing)
             dep_ctx = _build_dep_ctx(deps, resolved, nodes_by_id)
+            iface_defs = _get_interfaces_for_hlig(hlig_graph, hlig_id) if hlig_graph else None
+            doc = self._generate_design_doc(
+                node, dep_ctx, session_id, causal_path=causal_path, causal_parent_context=causal_parent_context,
+                interface_definitions=iface_defs,
+            )
+            if doc:
+                safe_name = _safe_filename(node.get("title", nid))
+                fp = designs_dir / f"{nid}_{safe_name}.json"
+                fp.write_text(doc, encoding="utf-8")
+                resolved[nid] = _truncate_design(doc)
+                generated_design.append(f"designs/{fp.name}")
+            log_pipeline_event(session_id, "design_generated", {"node": nid})
 
-            if task_type in ("design", "documentation"):
+        enable_local_build = os.environ.get("ENABLE_LOCAL_BUILD", "1").strip().lower() not in ("0", "false", "no")
+        max_build_retries = 1
+        compile_errors = None
+        for build_attempt in range(max_build_retries + 1):
+            generated_code = []
+            for node in order:
+                nid = node.get("id", "")
+                task_type = (node.get("task_type") or "").lower()
+                if task_type not in ("code", "integration", "test", "build", "verification"):
+                    continue
+                deps = node.get("dependencies") or []
+                dep_ctx = _build_dep_ctx(deps, resolved, nodes_by_id)
                 iface_defs = _get_interfaces_for_hlig(hlig_graph, hlig_id) if hlig_graph else None
-                doc = self._generate_design_doc(
-                    node, dep_ctx, session_id, causal_path=causal_path, causal_parent_context=causal_parent_context,
-                    interface_definitions=iface_defs,
-                )
-                if doc:
-                    safe_name = _safe_filename(node.get("title", nid))
-                    fp = designs_dir / f"{nid}_{safe_name}.json"
-                    fp.write_text(doc, encoding="utf-8")
-                    resolved[nid] = _truncate_design(doc)
-                    generated.append(f"designs/{fp.name}")
-                log_pipeline_event(session_id, "design_generated", {"node": nid})
-
-            elif task_type in ("code", "integration", "test", "build", "verification"):
-                iface_defs = _get_interfaces_for_hlig(hlig_graph, hlig_id) if hlig_graph else None
+                impl_brief = _build_implementation_brief(dep_ctx, iface_defs, node, framework)
                 files = self._generate_code(
                     node, framework, dep_ctx, session_id, causal_path=causal_path, causal_parent_context=causal_parent_context,
                     interface_definitions=iface_defs,
+                    compile_errors=compile_errors,
+                    design_docs_available=True,
+                    implementation_brief=impl_brief,
                 )
                 for rel_path, content in files.items():
                     full_path = hlig_dir / rel_path
                     full_path.parent.mkdir(parents=True, exist_ok=True)
                     full_path.write_text(content, encoding="utf-8")
-                    generated.append(rel_path)
+                    generated_code.append(rel_path)
                 if files:
                     resolved[nid] = _make_code_output_spec(nid, list(files.items()))
                     log_pipeline_event(session_id, "code_generated", {"node": nid, "files": list(files.keys())})
-
-        self._write_readme(hlig_dir, hlig_node, framework, generated)
+            self._scaffold_project(hlig_dir, framework, hlig_node)
+            self._write_readme(hlig_dir, hlig_node, framework, generated_design + generated_code)
+            if not enable_local_build:
+                break
+            success, out, err = _run_local_build(hlig_dir, framework)
+            _write_build_log(hlig_dir, success, out, err)
+            if success:
+                log_pipeline_event(session_id, "local_build_ok", {"hlig": hlig_id})
+                break
+            compile_errors = f"Previous build failed.\nstdout:\n{out}\nstderr:\n{err}"
+            log_pipeline_event(session_id, "local_build_retry", {"hlig": hlig_id, "attempt": build_attempt + 1, "stderr_preview": (err or out)[:500]})
         return hlig_dir
 
     def _load_existing_design_docs(self, designs_dir: Path) -> dict[str, str]:
@@ -602,11 +771,12 @@ edition = "2021"
         hlig_graph: HLIGGraph,
         session_id: str,
         outputs_dir: Path,
+        has_design_docs: bool = True,
     ) -> Path | None:
         """
         Generate only code for code-type DTG nodes.
-        Reads design spec from designs/ when present; for missing design deps (e.g. hlig_no_design_docs),
-        injects dtg_node_ref from DTG metadata. All dependency_context uses canonical JSON formats.
+        When has_design_docs is False (e.g. hlig_no_design_docs pipeline), does not load from designs/;
+        dependency context uses dtg_node_ref from DTG metadata only. When True, loads design specs from designs/.
         """
         topo_order = hlig_graph.topological_order()
         node_data_by_id = {nid: dict(data) for nid, data in hlig_graph.nodes()}
@@ -625,41 +795,62 @@ edition = "2021"
             try:
                 framework = _infer_framework(hlig_node)
                 designs_dir = hlig_dir / "designs"
-                resolved = self._load_existing_design_docs(designs_dir)
+                if has_design_docs and designs_dir.exists():
+                    resolved = self._load_existing_design_docs(designs_dir)
+                else:
+                    resolved = {}
                 order = _topological_order(dtg)
                 nodes_by_id = {n["id"]: n for n in order if n.get("id")}
-                generated: list[str] = []
-                for node in order:
-                    task_type = (node.get("task_type") or "").lower()
-                    if task_type not in ("code", "integration", "test", "build", "verification"):
-                        continue
-                    nid2 = node.get("id", "")
-                    deps = node.get("dependencies") or []
-                    dep_ctx = _build_dep_ctx(deps, resolved, nodes_by_id)
-                    causal_path: list[dict] = []
-                    if hasattr(hlig_graph, "get_causal_path"):
-                        path_tuples = hlig_graph.get_causal_path(nid)
-                        causal_path = [
-                            {"id": nid3, "task": d.get("task", ""), "outputs": d.get("outputs", [])}
-                            for nid3, d in path_tuples
-                        ]
-                    files = self._generate_code(
-                        node, framework, dep_ctx, session_id,
-                        causal_path=causal_path,
-                        causal_parent_context=causal_parent_context if causal_parent_context else None,
-                        interface_definitions=_get_interfaces_for_hlig(hlig_graph, nid),
-                    )
-                    for rel_path, content in files.items():
-                        full_path = hlig_dir / rel_path
-                        full_path.parent.mkdir(parents=True, exist_ok=True)
-                        full_path.write_text(content, encoding="utf-8")
-                        generated.append(rel_path)
-                    if files:
-                        resolved[nid2] = _make_code_output_spec(nid2, list(files.items()))
-                        log_pipeline_event(session_id, "code_generated", {"node": nid2, "files": list(files.keys())})
-                self._scaffold_project(hlig_dir, framework, hlig_node)
-                existing = [f.name for f in ((list(designs_dir.glob("*.json")) + list(designs_dir.glob("*.md"))) if designs_dir.exists() else [])]
-                self._write_readme(hlig_dir, hlig_node, framework, generated + [f"designs/{x}" for x in existing])
+                enable_local_build = os.environ.get("ENABLE_LOCAL_BUILD", "1").strip().lower() not in ("0", "false", "no")
+                max_build_retries = 1
+                compile_errors = None
+                for build_attempt in range(max_build_retries + 1):
+                    generated = []
+                    for node in order:
+                        task_type = (node.get("task_type") or "").lower()
+                        if task_type not in ("code", "integration", "test", "build", "verification"):
+                            continue
+                        nid2 = node.get("id", "")
+                        deps = node.get("dependencies") or []
+                        dep_ctx = _build_dep_ctx(deps, resolved, nodes_by_id)
+                        iface_defs = _get_interfaces_for_hlig(hlig_graph, nid)
+                        impl_brief = _build_implementation_brief(dep_ctx, iface_defs, node, framework)
+                        causal_path = []
+                        if hasattr(hlig_graph, "get_causal_path"):
+                            path_tuples = hlig_graph.get_causal_path(nid)
+                            causal_path = [
+                                {"id": nid3, "task": d.get("task", ""), "outputs": d.get("outputs", [])}
+                                for nid3, d in path_tuples
+                            ]
+                        files = self._generate_code(
+                            node, framework, dep_ctx, session_id,
+                            causal_path=causal_path,
+                            causal_parent_context=causal_parent_context if causal_parent_context else None,
+                            interface_definitions=iface_defs,
+                            compile_errors=compile_errors,
+                            design_docs_available=has_design_docs,
+                            implementation_brief=impl_brief,
+                        )
+                        for rel_path, content in files.items():
+                            full_path = hlig_dir / rel_path
+                            full_path.parent.mkdir(parents=True, exist_ok=True)
+                            full_path.write_text(content, encoding="utf-8")
+                            generated.append(rel_path)
+                        if files:
+                            resolved[nid2] = _make_code_output_spec(nid2, list(files.items()))
+                            log_pipeline_event(session_id, "code_generated", {"node": nid2, "files": list(files.keys())})
+                    self._scaffold_project(hlig_dir, framework, hlig_node)
+                    existing = [f.name for f in ((list(designs_dir.glob("*.json")) + list(designs_dir.glob("*.md"))) if designs_dir.exists() else [])]
+                    self._write_readme(hlig_dir, hlig_node, framework, generated + [f"designs/{x}" for x in existing])
+                    if not enable_local_build:
+                        break
+                    success, out, err = _run_local_build(hlig_dir, framework)
+                    _write_build_log(hlig_dir, success, out, err)
+                    if success:
+                        log_pipeline_event(session_id, "local_build_ok", {"hlig": nid})
+                        break
+                    compile_errors = f"Previous build failed.\nstdout:\n{out}\nstderr:\n{err}"
+                    log_pipeline_event(session_id, "local_build_retry", {"hlig": nid, "attempt": build_attempt + 1, "stderr_preview": (err or out)[:500]})
                 task = hlig_node.get("task", "")
                 readme = hlig_dir / "README.md"
                 summary = readme.read_text(encoding="utf-8")[:3000] if readme.exists() else ""

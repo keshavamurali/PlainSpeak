@@ -11,11 +11,12 @@ from core.plan_graph import PlanGraph
 from core.hlig_dtg_graphs import HLIGGraph, DTGGraph, GraphCycleError
 
 try:
-    from core.debug_logger import log_pipeline_event, log_user_input, get_session_usage, log_token_summary
+    from core.debug_logger import log_pipeline_event, log_user_input, get_session_usage, log_token_summary, CostLimitExceeded
 except ImportError:
     log_pipeline_event = log_user_input = lambda *a, **kw: None
     get_session_usage = lambda _: {}
     log_token_summary = lambda *a, **kw: None
+    CostLimitExceeded = Exception  # noqa: type for isinstance check
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SESSIONS_BASE = PROJECT_ROOT / "session_log" / "sessions"
@@ -326,6 +327,8 @@ class AgentRunner:
             except Exception as e:
                 log_pipeline_event(ctx.session_id, "artifact_generation_error", {"error": str(e)})
                 ctx.add_artifact("design_doc_generator", {"output": f"Error: {e}", "error": str(e)})
+                if isinstance(e, CostLimitExceeded):
+                    raise
             return ctx
 
         if agent_name == "design_reviewer":
@@ -354,18 +357,24 @@ class AgentRunner:
                 from core.dtg_artifact_generator import DTGArtifactGenerator, _write_interface_definitions
                 gen = DTGArtifactGenerator()
                 outputs_path = None
+                pipeline_steps = ctx.globals_schema.get("pipeline_steps", [])
+                has_design_docs = "design_doc_generator" in pipeline_steps
                 existing_outputs = ctx.globals_schema.get("artifact_outputs_path")
                 if existing_outputs and Path(existing_outputs).exists():
-                    outputs_path = gen.generate_code_only(ctx.hlig_graph, ctx.session_id, Path(existing_outputs))
+                    outputs_path = gen.generate_code_only(
+                        ctx.hlig_graph, ctx.session_id, Path(existing_outputs), has_design_docs=has_design_docs
+                    )
                 else:
-                    # No design docs: create outputs dir, write interfaces, generate code only (saves LLM cost)
+                    # No design docs pipeline (e.g. hlig_no_design_docs): create outputs dir, write interfaces, generate code only
                     dt = datetime.now()
                     date_dir = SESSIONS_BASE / str(dt.year) / f"{dt.month:02d}" / f"{dt.day:02d}"
                     date_dir.mkdir(parents=True, exist_ok=True)
                     outputs_dir = date_dir / f"outputs_{ctx.session_id}"
                     outputs_dir.mkdir(parents=True, exist_ok=True)
                     _write_interface_definitions(ctx.hlig_graph, outputs_dir)
-                    outputs_path = gen.generate_code_only(ctx.hlig_graph, ctx.session_id, outputs_dir)
+                    outputs_path = gen.generate_code_only(
+                        ctx.hlig_graph, ctx.session_id, outputs_dir, has_design_docs=has_design_docs
+                    )
                 if outputs_path:
                     ctx.globals_schema["artifact_outputs_path"] = str(outputs_path)
                     log_pipeline_event(ctx.session_id, "artifact_generation_completed", {"path": str(outputs_path)})
@@ -374,6 +383,8 @@ class AgentRunner:
             except Exception as e:
                 log_pipeline_event(ctx.session_id, "artifact_generation_error", {"error": str(e)})
                 ctx.add_artifact("coder", {"output": f"Error: {e}", "error": str(e)})
+                if isinstance(e, CostLimitExceeded):
+                    raise
             return ctx
 
         if agent_name == "code_reviewer":
@@ -471,6 +482,7 @@ class AgentRunner:
             if isinstance(pipeline, str)
             else (pipeline or pipelines.get(default_pipeline, []))
         )
+        ctx.globals_schema["pipeline_steps"] = list(step_names)
 
         # Seed globals
         ctx.globals_schema.setdefault("original_query", ctx.get_state("query", ""))
@@ -567,102 +579,118 @@ class AgentRunner:
 
         # Phase 2: DAG execution
         bus = _get_event_bus()
-        while plan.has_pending():
-            ready = plan.get_ready_steps()
-            if not ready:
-                break
-            for node_id in ready:
-                node_data = plan.get_node(node_id)
-                if not node_data:
-                    continue
-                agent_name = node_data.get("agent", "")
-                if agent_name == "System" or not agent_name:
-                    plan.mark_done(node_id)
-                    continue
+        try:
+            while plan.has_pending():
+                ready = plan.get_ready_steps()
+                if not ready:
+                    break
+                for node_id in ready:
+                    node_data = plan.get_node(node_id)
+                    if not node_data:
+                        continue
+                    agent_name = node_data.get("agent", "")
+                    if agent_name == "System" or not agent_name:
+                        plan.mark_done(node_id)
+                        continue
 
-                plan.mark_running(node_id)
-                log_pipeline_event(ctx.session_id, "node_started", {"node_id": node_id, "agent": agent_name})
-                try:
-                    phase_ctx = self._run_pipeline_phase(agent_name, node_id, node_data, ctx, steps)
-                    if phase_ctx is not None:
-                        ctx = phase_ctx
-                    else:
-                        ctx = self._run_node(node_id, node_data, ctx, steps, BaseAgent)
-                    output = ctx.get_artifact(agent_name, {})
-                    if isinstance(output, dict) and "output" in output:
-                        out_val = output.get("output", output)
-                    else:
-                        out_val = output
-                    if _is_clarification_request(out_val) and wait_for_input:
-                        plan.get_node(node_id)["status"] = "waiting_input"
-                        if on_step_complete:
-                            try:
-                                on_step_complete(ctx)
-                            except Exception:
-                                pass
-                        write_key = out_val.get("writes_to", "user_clarification")
-                        cl_msg = out_val.get("clarificationMessage", "Please provide input.")
-                        log_pipeline_event(ctx.session_id, "waiting_user_input", {"node": node_id, "message": cl_msg[:200]})
-                        user_response = wait_for_input(
-                            node_id,
-                            cl_msg,
-                            out_val.get("options"),
-                            write_key,
-                        )
-                        log_user_input(ctx.session_id, node_id, cl_msg, user_response)
-                        # Accumulate when write_key is user_clarification (avoids repeated questions)
-                        if write_key == "user_clarification":
-                            existing = ctx.globals_schema.get(write_key, "")
-                            ctx.globals_schema[write_key] = (
-                                f"{existing}\n\n{user_response}".strip() if existing else user_response
-                            )
+                    plan.mark_running(node_id)
+                    log_pipeline_event(ctx.session_id, "node_started", {"node_id": node_id, "agent": agent_name})
+                    try:
+                        phase_ctx = self._run_pipeline_phase(agent_name, node_id, node_data, ctx, steps)
+                        if phase_ctx is not None:
+                            ctx = phase_ctx
                         else:
-                            ctx.globals_schema[write_key] = user_response
+                            ctx = self._run_node(node_id, node_data, ctx, steps, BaseAgent)
+                        output = ctx.get_artifact(agent_name, {})
+                        if isinstance(output, dict) and "output" in output:
+                            out_val = output.get("output", output)
+                        else:
+                            out_val = output
+                        if _is_clarification_request(out_val) and wait_for_input:
+                            plan.get_node(node_id)["status"] = "waiting_input"
+                            if on_step_complete:
+                                try:
+                                    on_step_complete(ctx)
+                                except Exception:
+                                    pass
+                            write_key = out_val.get("writes_to", "user_clarification")
+                            cl_msg = out_val.get("clarificationMessage", "Please provide input.")
+                            log_pipeline_event(ctx.session_id, "waiting_user_input", {"node": node_id, "message": cl_msg[:200]})
+                            user_response = wait_for_input(
+                                node_id,
+                                cl_msg,
+                                out_val.get("options"),
+                                write_key,
+                            )
+                            log_user_input(ctx.session_id, node_id, cl_msg, user_response)
+                            # Accumulate when write_key is user_clarification (avoids repeated questions)
+                            if write_key == "user_clarification":
+                                existing = ctx.globals_schema.get(write_key, "")
+                                ctx.globals_schema[write_key] = (
+                                    f"{existing}\n\n{user_response}".strip() if existing else user_response
+                                )
+                            else:
+                                ctx.globals_schema[write_key] = user_response
+                            if on_step_complete:
+                                try:
+                                    on_step_complete(ctx)
+                                except Exception:
+                                    pass
+                            out_val = {"clarificationMessage": out_val.get("clarificationMessage"), "user_response": user_response}
+                            plan.mark_done(node_id, output=out_val)
+                        else:
+                            plan.mark_done(node_id, output=out_val)
+                            self._extract_writes(ctx, node_data, out_val)
+
+                        spec = steps.get(agent_name, {})
+                        prompt_file = spec.get("prompt_file")
+                        agent = BaseAgent(
+                            name=agent_name,
+                            prompt_file=PROJECT_ROOT / prompt_file if prompt_file else None,
+                            config=spec.get("config", {}),
+                            multi_mcp=self._multi_mcp,
+                        )
+                        ctx.record_agent_run(agent_name, agent)
+                        log_pipeline_event(ctx.session_id, "node_completed", {"node_id": node_id, "agent": agent_name})
+
                         if on_step_complete:
                             try:
                                 on_step_complete(ctx)
                             except Exception:
                                 pass
-                        out_val = {"clarificationMessage": out_val.get("clarificationMessage"), "user_response": user_response}
-                        plan.mark_done(node_id, output=out_val)
-                    else:
-                        plan.mark_done(node_id, output=out_val)
-                        self._extract_writes(ctx, node_data, out_val)
-
-                    spec = steps.get(agent_name, {})
-                    prompt_file = spec.get("prompt_file")
-                    agent = BaseAgent(
-                        name=agent_name,
-                        prompt_file=PROJECT_ROOT / prompt_file if prompt_file else None,
-                        config=spec.get("config", {}),
-                        multi_mcp=self._multi_mcp,
-                    )
-                    ctx.record_agent_run(agent_name, agent)
-                    log_pipeline_event(ctx.session_id, "node_completed", {"node_id": node_id, "agent": agent_name})
-
-                    if on_step_complete:
-                        try:
-                            on_step_complete(ctx)
-                        except Exception:
-                            pass
-                    if bus and self._loop:
-                        import asyncio
-                        fut = asyncio.run_coroutine_threadsafe(
-                            bus.publish("step_completed", ctx.session_id, {
-                                "step": agent_name,
-                                "node_id": node_id,
-                                "session_id": ctx.session_id,
-                                "artifacts": dict(ctx.artifacts),
-                            }),
-                            self._loop,
-                        )
-                        try:
-                            fut.result(timeout=2)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    plan.mark_failed(node_id, error=str(e))
-                    raise
+                        if bus and self._loop:
+                            import asyncio
+                            fut = asyncio.run_coroutine_threadsafe(
+                                bus.publish("step_completed", ctx.session_id, {
+                                    "step": agent_name,
+                                    "node_id": node_id,
+                                    "session_id": ctx.session_id,
+                                    "artifacts": dict(ctx.artifacts),
+                                }),
+                                self._loop,
+                            )
+                            try:
+                                fut.result(timeout=2)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        plan.mark_failed(node_id, error=str(e))
+                        raise
+        except CostLimitExceeded:
+            # Log final cost and run_completed before re-raising so logs show why run stopped
+            totals = get_session_usage(ctx.session_id)
+            if totals:
+                log_token_summary(ctx.session_id, totals)
+                log_pipeline_event(
+                    ctx.session_id,
+                    "run_completed",
+                    {
+                        "total_cost_usd": totals.get("cost_usd", 0),
+                        "total_tokens": totals.get("total_tokens", 0),
+                        "stopped": "cost_limit_exceeded",
+                    },
+                )
+            raise
 
         # Log session-level token/cost summary and run completed with total cost
         totals = get_session_usage(ctx.session_id)

@@ -125,6 +125,32 @@ def get_session_usage(session_id: str) -> dict:
     return dict(_session_usage.get(key, {}))
 
 
+def check_cost_limit_before_llm(session_id: str) -> None:
+    """
+    If session cost already >= limit, raise CostLimitExceeded so caller skips the LLM call.
+    Call this at the start of _call_llm to avoid making a request when limit is already exceeded.
+    """
+    if not session_id or _COST_LIMIT <= 0:
+        return
+    totals = get_session_usage(session_id)
+    if totals.get("cost_usd", 0) >= _COST_LIMIT:
+        raise CostLimitExceeded(session_id, totals["cost_usd"], _COST_LIMIT)
+
+
+def log_llm_input(session_id: str, agent_name: str, input_content: dict | str) -> None:
+    """Log the input sent to the LLM (before the call). Use a clear header so logs show it is input to LLM."""
+    ts = _timestamp()
+    entry = f"\n{'='*80}\n[{ts}] INPUT TO LLM | session={session_id} | agent={agent_name}\n"
+    entry += "The following is the input payload or prompt content sent to the LLM:\n"
+    entry += "-" * 40 + "\n"
+    if isinstance(input_content, dict):
+        entry += _format_value(input_content) + "\n"
+    else:
+        entry += _truncate(str(input_content)) + "\n"
+    entry += "-" * 40 + "\n"
+    _write(session_id, entry)
+
+
 def log_llm_call(
     session_id: str,
     agent_name: str,

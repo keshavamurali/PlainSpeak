@@ -153,8 +153,6 @@
       return { nodes: dtg.nodes, edges: dtg.edges || [], type: "dtg", hligId: mode };
     }
 
-    let currentEdgesRaw = [];
-
     function buildNetworkData() {
       const { nodes, edges: edgesRaw, type } = getActiveGraph();
       currentEdgesRaw = edgesRaw || [];

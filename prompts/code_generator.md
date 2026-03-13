@@ -9,6 +9,9 @@ You will receive:
 - `parent_hlig`: parent HLIG context
 - `framework`: one of `node-react` (Node.js + React) or `rust-tauri` (Rust + Tauri)
 - `dependency_context`: Map of DTG node ID → content. All values are **canonical JSON** for LLM consumption.
+- `design_docs_available`: Boolean. When **false** (e.g. `hlig_no_design_docs` pipeline), no design documents were generated; rely on `implementation_brief` and `dependency_context` (dtg_node_ref) only. When true, design_spec may appear in dependency_context.
+- `implementation_brief`: **Full design-based prompt** summarizing what to implement. When present, **use this as the primary source of requirements**: it includes implementation steps, architecture, constraints, required interfaces, and the compilation requirement. Follow it in addition to the main coder prompt.
+- `compile_errors` (optional): If present, the previous build failed. Contains stdout/stderr from the build. Fix the code so it compiles and output the corrected files.
 
 **dependency_context value types** (parse JSON; check `type` field):
 
@@ -33,7 +36,7 @@ Parse the JSON and follow `implementation_instructions` from design_spec when pr
 - `causal_path`: Ordered list of HLIG nodes that led to this one (traceability). Each has `id`, `task`, `outputs`.
 - `causal_parent_context`: Output summaries from causal parent HLIG nodes only (Markov blanket). Use when present; prefer over unrelated context.
 
-**Interface contracts:** When `interface_definitions` is provided (from shared/interfaces.json), it contains the API/DB/message contracts between HLIG subsystems. When implementing API servers or clients, follow the endpoints and schemas defined there. Both Frontend and Backend read the same contract.
+**Interface contracts:** When `interface_definitions` is provided (from shared/interfaces.json), it contains the API/DB/message contracts between HLIG subsystems. When implementing API servers or clients, follow the endpoints and schemas defined there. Both Frontend and Backend read the same contract. The `implementation_brief` may also include a "Required interfaces" section — implement and respect those contracts so code compiles and integrates correctly.
 
 ## Framework Guidelines
 
@@ -80,10 +83,19 @@ When `parent_hlig.external_interfaces` includes DB, Auth, Storage, etc., use **e
 
 The system auto-provisions `.env` with mock values (SQLite, local paths). Generated code MUST read from env vars, not hardcoded URLs.
 
+## Compilable code (required)
+
+Your output **must** compile and build without errors. The system will run `cargo build` (Rust) or `npm run build` (Node) and may retry with compiler output if build fails. The `implementation_brief` includes a "Compilation requirement" section — treat it as mandatory.
+
+- **Rust:** Use valid Rust 2021 syntax. Every `use`, type, and function must resolve. Match crate names in Cargo.toml. Do not use undefined types or miss required imports. Prefer `cargo check`-clean code.
+- **Node/React:** Use valid JavaScript/ES module syntax. All imports must resolve; export what you use. Ensure `package.json` scripts and dependencies are consistent with the code.
+- When **`compile_errors`** is present in the input: a previous build failed. Read the stdout/stderr in `compile_errors` and **fix the generated code** so the project builds. Output only the corrected file(s) that need changes (you may output multiple files). Do not introduce new errors.
+
 ## Rules
 
 - Output **only** valid JSON. No commentary before or after.
-- Generate complete, runnable code
+- When **implementation_brief** is provided, treat it as the primary design input: follow its implementation steps, constraints, interfaces, and compilation requirement before generating code.
+- Generate complete, **compilable**, runnable code
 - Follow the specified framework's conventions
 - Integrate with dependency_context when provided
 - Use env vars for DB/Storage/Auth (see above)
