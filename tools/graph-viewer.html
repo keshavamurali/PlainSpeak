@@ -158,21 +158,48 @@
       currentEdgesRaw = edgesRaw || [];
       if (!nodes?.length) return null;
 
-      const visNodes = new vis.DataSet(nodes.map(n => ({
-        id: n.id,
-        label: type === "hlig"
+      const visNodes = new vis.DataSet(nodes.map(n => {
+        const baseLabel = type === "hlig"
           ? n.id + "\n" + (n.task || "").slice(0, 40) + (n.task?.length > 40 ? "…" : "")
-          : n.id + "\n" + (n.title || "").slice(0, 40) + (n.title?.length > 40 ? "…" : ""),
-        title: type === "hlig" ? (n.task || n.id) : (n.title || n.id),
-      })));
+          : n.id + "\n" + (n.title || "").slice(0, 40) + (n.title?.length > 40 ? "…" : "");
+        const nodeType = n.node_type || n.task_type || "";
+        // Color-code DTG nodes by node_type for easier inspection.
+        let color = { background: "#ede9fe", border: "#8b5cf6" };
+        if (type === "dtg") {
+          const t = String(nodeType).toLowerCase();
+          if (t === "design") {
+            color = { background: "#dbeafe", border: "#1d4ed8" };
+          } else if (t === "coding") {
+            color = { background: "#dcfce7", border: "#16a34a" };
+          } else if (t === "evaluation") {
+            color = { background: "#fef3c7", border: "#d97706" };
+          } else if (t === "tool") {
+            color = { background: "#f5f3ff", border: "#7c3aed" };
+          } else if (t === "reasoning") {
+            color = { background: "#fee2e2", border: "#b91c1c" };
+          }
+        }
+        return {
+          id: n.id,
+          label: baseLabel,
+          title: type === "hlig" ? (n.task || n.id) : (n.title || n.id),
+          color,
+        };
+      }));
 
-      const visEdges = new vis.DataSet(edgesRaw.map((e, i) => ({
-        id: "e" + i,
-        from: e.from ?? e.source,
-        to: e.to ?? e.target,
-        label: (e.interface_type || e.dependency_type || ""),
-        arrows: "to",
-      })));
+      const visEdges = new vis.DataSet(edgesRaw.map((e, i) => {
+        const edgeType = (e.edge_type || "").toLowerCase();
+        const isData = edgeType === "data" || (e.dependency_type === "data-flow");
+        return {
+          id: "e" + i,
+          from: e.from ?? e.source,
+          to: e.to ?? e.target,
+          label: (e.interface_type || e.dependency_type || ""),
+          arrows: "to",
+          dashes: isData,
+          color: isData ? { color: "#94a3b8" } : undefined,
+        };
+      }));
 
       return { nodes: visNodes, edges: visEdges, type };
     }

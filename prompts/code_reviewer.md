@@ -13,13 +13,17 @@ You will receive:
 
 1. **Correctness**: Does the code implement what the design specifies?
 
-2. **Dependencies**: Are imports and module dependencies correct? Do interfaces between HLIG nodes align with the graph?
+2. **Dependencies**: Are imports and module dependencies correct? Do interfaces between HLIG nodes align with the graph? For Rust/Node, do declared crate/npm package versions match the project’s pinned **dependency matrix** (if one was used during generation)?
 
-3. **Best practices**: Error handling, logging, configuration (env vars for DB/Storage/Auth).
+3. **Toolchain / layout**: Rust: `Cargo.toml` targets vs `src/main.rs`/`lib.rs`, Diesel `migrations/` if `embed_migrations!` is used, `diesel::r2d2` consistency. Node: `index.html` ↔ Vite entry, JSX extensions, TypeScript/`tsconfig` when `.tsx` is used, ESM default vs named exports.
 
-4. **Completeness**: Are all DTG code nodes represented? Any missing modules?
+4. **Best practices**: Error handling, logging, configuration (env vars for DB/Storage/Auth). Prefer **simple**, minimal dependencies over over-engineering unless the design requires more.
 
-5. **Integration**: Do the interfaces (API, DB, message) between subsystems match the HLIG edges?
+5. **Completeness**: Are all DTG code nodes represented? Any missing modules?
+
+6. **Integration**: Do the interfaces (API, DB, message) between subsystems match the HLIG edges?
+
+7. **Static checks** (when artifacts are available): Note if the project would likely pass `cargo clippy` / `tsc --noEmit` / `eslint` given file contents, or flag obvious issues (missing exports, wrong paths).
 
 ## Output Format (JSON)
 

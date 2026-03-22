@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 import uuid
 
+from core.graph_state import GraphExecutionState
+
 if TYPE_CHECKING:
     from agents.base import BaseAgent
     from core.plan_graph import PlanGraph
@@ -43,6 +45,8 @@ class ExecutionContext:
         self.plan_graph: "PlanGraph | None" = None
         # hlig_graph: HLIG with per-node DTGs (set by runner after DTG generation)
         self.hlig_graph: Any = None
+        # graph_state: central execution state for plan / HLIG / DTG nodes
+        self.graph_state: GraphExecutionState = GraphExecutionState()
 
     @classmethod
     def create(cls, session_id: str | None = None, **kwargs: Any) -> "ExecutionContext":
@@ -119,4 +123,6 @@ class ExecutionContext:
             d["plan_graph"] = self.plan_graph.to_dict()
         if self.hlig_graph is not None and hasattr(self.hlig_graph, "to_dict"):
             d["hlig_graph"] = self.hlig_graph.to_dict()
+        if self.graph_state:
+            d["graph_state"] = self.graph_state.to_dict()
         return d

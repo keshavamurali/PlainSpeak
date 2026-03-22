@@ -1,0 +1,74 @@
+# Pinned dependency matrix for code generation. Use only these versions/features
+# so that generated Cargo.toml and package.json build successfully.
+# The implementation_brief injects these rules into the coder prompt.
+# Post-generation, Cargo.toml is corrected to match this matrix before build.
+
+rust-tauri:
+  # Cargo.toml: use these exact version constraints. Do not use removed features.
+  cargo_rules: |
+    - Cargo.toml MUST include either [[bin]] (for src/main.rs) or [lib] (for src/lib.rs). Never leave the manifest without targets.
+    - If you add a binary, create or keep src/main.rs. If you add a library, create or keep src/lib.rs.
+    - Use only the dependency versions and feature names listed below. Do not use features that do not exist.
+    - Tauri: use only officially documented features for the pinned Tauri 2.x version. In particular, do NOT use features like "shell-open", "disable-devtools", "api-all", or "ipc-all" (they do not exist). Use default features or only features explicitly listed here.
+    - tauri-build version is separate from tauri; use the exact tauri-build version listed below (e.g. 2.5), not a version matching tauri.
+    - Do not create both src/X.rs and src/X/mod.rs for the same module; use one (either a single file or a directory with mod.rs).
+    - Use semicolons after statement expressions where required (e.g. before Ok(()) or the next statement).
+    - **HTTP server crates:** Prefer **Actix Web** with the pinned `actix-web` / `actix-files` versions below, or **Axum** with the pinned `axum` version. Do not mix incompatible tower/actix versions; use only one framework per binary unless the design explicitly splits services.
+    - **System toolchain:** Generated code assumes `cargo` + `rustc` (Rust 2021) and a normal C toolchain for native deps where required. SQLite is typically via Diesel + libsqlite at link time.
+  diesel_sqlite_rules: |
+    - **Imports and derives:** In every module that uses Diesel models or queries, start with `use diesel::prelude::*;` (or explicitly `use diesel::{Insertable, Queryable, Selectable, Identifiable, AsChangeset, ...}` as needed). `#[diesel(table_name = ...)]` and `#[diesel(...)]` field attributes ONLY work on structs that derive the matching Diesel traits (`Insertable`, `Queryable`, `Selectable`, etc.). Missing prelude imports cause "cannot find derive macro `Insertable`" / "`diesel` is a crate, not an attribute".
+    - **Diesel 2.x error handling — NEVER invent API:** Do NOT use `diesel::result::DatabaseErrorKind::CannotConnect` — that variant does not exist in Diesel 2.3. Match `diesel::result::Error` only: e.g. `Error::DatabaseError(kind, info)` where `kind` is a **documented** variant such as `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`, `CheckViolation`, `SerializationFailure`, `ReadOnlyTransaction`, `UnableToSendCommand`, or use a catch-all `_` arm. For **connection pool** failures when using Diesel's pool, use **`diesel::r2d2::Error`** (same crate path as `Pool` / `ConnectionManager`). Do not use the standalone **`r2d2::Error`** type from a separate `r2d2` dependency together with `diesel::r2d2::Pool` — they are different types (E0308).
+    - **Connection pool — Diesel's r2d2 only:** Use `use diesel::r2d2::{ConnectionManager, Pool};` and type aliases like `type DbPool = Pool<ConnectionManager<SqliteConnection>>;`. Do **not** add `[dependencies] r2d2 = "0.8"` for pooling alongside Diesel unless you know you need the standalone crate for something else; prefer **only** `diesel` with features `["sqlite", "r2d2", ...]` so `Pool::builder().build()` returns `Result<_, diesel::r2d2::Error>`.
+    - **diesel_migrations + `embed_migrations!`:** Store migrations in **`migrations/`** next to **`Cargo.toml`** (crate/project root), not under `src/`. In Rust source use **`embed_migrations!("migrations")`** — path is relative to the **`Cargo.toml` directory**. Do **not** use `embed_migrations!("../migrations")` unless migrations truly live outside the crate (avoid in generated projects). Each migration is a subfolder `migrations/YYYY-MM-DD-HHMMSS_name/` containing **`up.sql`** (required) and optionally `down.sql`. If you reference `embed_migrations!`, you **must** emit those folders and SQL files in the same generation pass or the proc macro panics ("Failed to receive migrations dir").
+    - **`run_pending_migrations` (Diesel 2.x):** Returns `Result<Vec<MigrationVersion<'_>>, diesel::result::Error>`, not `Result<(), _>`. If the function must return `Result<(), E>`, use e.g. `conn.run_pending_migrations(MIGRATIONS).map(|_| ())?` or an equivalent map. Do not return the `Vec` result where `()` is expected (E0308).
+    - **SQLite vs PostgreSQL query patterns:** Default stack is **Diesel + SQLite** (see Cargo features). Do NOT write Postgres-only patterns unless `DATABASE_URL` is documented as Postgres and `diesel` uses the `postgres` feature instead of `sqlite`.
+    - **INSERT + RETURNING + `get_result` on SQLite:** Without the `returning_clauses_for_sqlite_3_35` feature, Diesel rejects `.returning(...).get_result(&mut conn)` for SQLite (`DoesNotSupportReturningClause`, E0277 on `ReturningClause`). **Preferred portable pattern:** `diesel::insert_into(table).values(&new_row).execute(&mut conn)?;` then load the row with a separate `select` by primary key, or use `diesel::RunQueryDsl::execute` + query by id. **If you use `.returning(...).get_result()`**, Cargo.toml MUST enable `returning_clauses_for_sqlite_3_35` on `diesel` (already in the matrix) and the returning columns must match the target struct exactly (`Selectable` / field order and types).
+    - **Queryable / Selectable / Insertable alignment:** The columns in `.select(...)`, `.returning(...)`, and `table::all_columns` must match the struct you load into (same count, order, and types). Use `#[derive(Queryable, Selectable, ...)]` with `#[diesel(table_name = ...)]` and prefer `.select(Model::as_select())` or explicit column lists that mirror the struct. Mismatches produce E0277 `CompatibleType` / `SelectBy` errors.
+    - SQLite has no native UUID type. Prefer `Text` in schema.rs for ID columns and `String` in Rust models, OR use `Binary` only with `Vec<u8>` — do not combine `Uuid` with `Binary` on SQLite unless you use exact matching diesel types and features.
+    - For timestamps on SQLite with Diesel, avoid `NaiveDateTime` + `Timestamp` mismatches: use `BigInt` + i64 (unix millis/seconds), or follow current Diesel docs for SQLite datetime types consistently in schema and models.
+    - Keep schema.rs `table!` column types and model `Queryable`/`Insertable` field types in strict agreement; one wrong mapping causes many E0277 errors.
+  dependencies:
+    # Tauri 2.x: use this pinned major version and compatible features only.
+    tauri: "2.0"
+    # tauri-build: use 2.5.x (crates.io); do not use 2.10.x (that version does not exist for tauri-build).
+    tauri-build: "2.5"
+    # Common backend crates (use versions that exist on crates.io)
+    actix-web: "4"
+    actix-files: "0.6"
+    # Alternative to Actix for pure HTTP APIs (use one of actix-web or axum per project)
+    axum: "0.7"
+    serde: { version: "1", features: ["derive"] }
+    serde_json: "1"
+    tempfile: "3"
+    tokio: { version: "1", features: ["full"] }
+    # Diesel 2.x + SQLite: r2d2 pool; returning_clauses_for_sqlite_3_35 allows .returning().get_result()
+    # when SQLite >= 3.35. If you avoid RETURNING entirely, builds still work on older SQLite.
+    diesel: { version: "2", features: ["sqlite", "r2d2", "returning_clauses_for_sqlite_3_35"] }
+    diesel_migrations: "2"
+
+node-react:
+  package_json_rules: |
+    - package.json MUST include a "build" script. Prefer "vite build" only (do not run "tsc" in the build script so type errors in tests do not block the app build).
+    - React + Vite: any file containing JSX MUST use extension .jsx or .tsx (never .js for JSX). Entry should be src/main.jsx or src/main.tsx; index.html script src must match.
+    - Use Vitest (vi) for tests only; do not use Jest (jest). Import vi from "vitest" for mocks.
+    - Export from api/client (or your API module) every function that hooks and components import (e.g. fetchAboutContent, fetchMenuPdf).
+    - tsconfig.json: valid JSON only; do not add "types" for packages not in package.json (e.g. testing-library__jest-dom). Use "vite/client" for import.meta.env. Exclude **/__tests__/** and **/*.test.* from compilation if you run tsc.
+    - Use the dependency versions listed below when possible to avoid resolution errors.
+    - **Node HTTP servers:** If the project includes Express or Fastify (API server in Node), use the **express** or **fastify** versions listed below. Add **typescript** to devDependencies when using `.ts`/`.tsx` so local `tsc --noEmit` checks can run.
+    - **ESLint (optional):** Pin **eslint** to **^8.57** in devDependencies for compatibility with **Node 18+** (avoid ESLint 9+/10 defaults that require Node 20+ and flat-config-only behavior from `npx`). If you use **flat config** (`eslint.config.js`) with TypeScript, add **`typescript-eslint`** to devDependencies (matrix version) so `import ... from 'typescript-eslint'` resolves. Alternatively use **`.eslintrc.cjs`** with `@typescript-eslint/parser` and `@typescript-eslint/eslint-plugin` at matrix versions. The local build runs **`npm exec eslint`** (your lockfile version), not `npx eslint@latest`.
+  dependencies:
+    react: "^18"
+    react-dom: "^18"
+    vite: "^5"
+    vitest: "^2"
+    "@testing-library/react": "^16"
+    "@testing-library/user-event": "^14"
+    typescript: "^5"
+    express: "^4"
+    fastify: "^4"
+    # ESLint 8.x works on Node 18; ESLint 10 requires Node 20+
+    eslint: "^8.57.0"
+    # For eslint.config.js: `import tseslint from 'typescript-eslint'`
+    typescript-eslint: "^7.18.0"
+    "@typescript-eslint/eslint-plugin": "^7.18.0"
+    "@typescript-eslint/parser": "^7.18.0"

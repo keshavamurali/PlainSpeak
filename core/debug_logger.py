@@ -53,6 +53,18 @@ def _log_path(session_id: str) -> Path:
     return _date_dir() / f"debug_session_{sid}.log"
 
 
+def _graph_execution_trace_path(session_id: str) -> Path:
+    """Path for plan-DAG execution trace: graph_execution_trace_<id>.log (under debug_logs/sessions/YYYY/MM/DD/)."""
+    sid = session_id.strip() or "no_session"
+    return _date_dir() / f"graph_execution_trace_{sid}.log"
+
+
+def _graph_execution_trace_enabled() -> bool:
+    """GRAPH_EXECUTION_TRACE defaults to on; set to 0/false/no to disable."""
+    v = os.environ.get("GRAPH_EXECUTION_TRACE", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def _truncate(s: str, max_len: int | None = None) -> str:
     limit = max_len if max_len is not None else MAX_LOG_BODY_CHARS
     if limit <= 0 or len(s) <= limit:
@@ -193,6 +205,54 @@ def log_pipeline_event(session_id: str, event: str, details: str | dict | None =
     if details:
         entry += f"  {_format_value(details, max_len=2000)}\n"
     _write(session_id, entry)
+
+
+def log_graph_execution_trace(session_id: str, event: str, details: dict | None = None) -> None:
+    """
+    Append a graph / plan-DAG execution trace line to a dedicated file (not mixed with LLM debug spam).
+
+    File: debug_logs/sessions/YYYY/MM/DD/graph_execution_trace_<session_id>.log
+    Disable: GRAPH_EXECUTION_TRACE=0
+
+    Events (emitted by AgentRunner): run_started, phase1_planner_done, plan_initialized,
+    node_started, node_skipped, node_waiting_input, node_completed, node_failed, run_stopped,
+    run_finished.
+    """
+    if not _graph_execution_trace_enabled():
+        return
+    try:
+        ts = _timestamp()
+        entry = f"[{ts}] TRACE | session={session_id} | {event}\n"
+        if details:
+            entry += f"  {_format_value(details, max_len=6000)}\n"
+        path = _graph_execution_trace_path(session_id)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except OSError:
+        pass
+
+
+def sanitize_plan_dict_for_trace(plan_dict: dict | None) -> dict:
+    """Strip heavy fields from plan.to_dict() for trace logging."""
+    if not plan_dict:
+        return {"nodes": [], "edges": []}
+    slim_nodes = []
+    for n in plan_dict.get("nodes", []):
+        nid = n.get("id")
+        if nid == "ROOT":
+            continue
+        slim_nodes.append({
+            "id": nid,
+            "agent": n.get("agent"),
+            "status": n.get("status"),
+            "description": str(n.get("description", ""))[:160],
+            "reads": n.get("reads"),
+            "writes": n.get("writes"),
+        })
+    return {
+        "nodes": slim_nodes,
+        "edges": list(plan_dict.get("edges", [])),
+    }
 
 
 def log_token_summary(session_id: str, totals: dict) -> None:

@@ -8,6 +8,7 @@ CVP (Causal Visual Programming) extensions:
 """
 
 import json
+from pathlib import Path
 from typing import Any
 
 import networkx as nx
@@ -31,6 +32,89 @@ class GraphCycleError(Exception):
             "Dependencies must form a DAG (no cycles)."
         )
         super().__init__(msg)
+
+
+def _split_hlig_control_and_data_edges(edges: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split HLIG edge dicts into control-flow vs data-flow (same rule as HLIGGraph.__init__)."""
+    control: list[dict] = []
+    data: list[dict] = []
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        et = (e.get("edge_type") or "").lower()
+        if et == "data":
+            data.append(e)
+        else:
+            control.append(e)
+    return control, data
+
+
+def break_hlig_control_edges_until_dag(
+    control_edges: list[dict],
+    node_ids: set[str],
+) -> tuple[list[dict], list[str]]:
+    """
+    Remove control edges until the graph is a DAG.
+
+    Each iteration finds one directed cycle and removes one edge on that cycle:
+    prefer edges **without** `interface_spec` / `interface_ref` (duplicate / causal ping-pong)
+    so contracts on typed edges are kept. Tie-break: lexicographically larger (from, to).
+
+    Preserves full dicts for remaining edges. Returns (new_control_edges, removed_summaries).
+    """
+    removed_summaries: list[str] = []
+    working: list[dict] = [dict(e) for e in control_edges if isinstance(e, dict)]
+
+    def _graph_from(edgelist: list[dict]) -> nx.DiGraph:
+        g = nx.DiGraph()
+        for nid in node_ids:
+            g.add_node(nid)
+        for e in edgelist:
+            u, v = e.get("from"), e.get("to")
+            if u and v:
+                if not g.has_node(u):
+                    g.add_node(u)
+                if not g.has_node(v):
+                    g.add_node(v)
+                g.add_edge(u, v)
+        return g
+
+    max_iter = len(working) + 8  # safety
+    iterations = 0
+    while iterations < max_iter:
+        iterations += 1
+        g = _graph_from(working)
+        if nx.is_directed_acyclic_graph(g):
+            break
+        try:
+            cycle = nx.find_cycle(g, orientation="original")
+        except Exception:
+            break
+        if not cycle:
+            break
+        pairs: list[tuple[str, str]] = []
+        for item in cycle:
+            pairs.append((item[0], item[1]))
+        pair_set = set(pairs)
+
+        def _strip_priority(e: dict) -> tuple:
+            """Higher = remove first: drop edges without interface payload before contract edges."""
+            u, v = e.get("from") or "", e.get("to") or ""
+            has_payload = bool(e.get("interface_spec") or e.get("interface_ref"))
+            tier = 0 if has_payload else 1
+            return (tier, u, v)
+
+        match_indices = [
+            i for i, e in enumerate(working) if (e.get("from"), e.get("to")) in pair_set
+        ]
+        if not match_indices:
+            break
+        rm_i = max(match_indices, key=lambda i: _strip_priority(working[i]))
+        e_rm = working.pop(rm_i)
+        fu, fv = e_rm.get("from"), e_rm.get("to")
+        removed_summaries.append(f"{fu} -> {fv}")
+
+    return working, removed_summaries
 
 
 def _raise_if_cycle(
@@ -69,12 +153,30 @@ class DTGGraph:
 
     def __init__(self, hlig_node_id: str, nodes: list[dict] | None = None, edges: list[dict] | None = None):
         self.hlig_node_id = hlig_node_id
+        # _g stores the **control-flow** edges only. Data-flow edges are tracked separately
+        # so that topological ordering is not affected by pure data dependencies.
         self._g = nx.DiGraph()
+        self._data_edges: list[tuple[str, str, dict]] = []
         if nodes:
             for n in nodes:
                 nid = n.get("id")
                 if nid:
                     attrs = {k: v for k, v in n.items() if k != "id"}
+                    # Infer node_type when not explicitly provided. This makes DTG node
+                    # roles explicit for visualization and policy decisions.
+                    if "node_type" not in attrs:
+                        task_type = (attrs.get("task_type") or "").lower()
+                        node_type = None
+                        if task_type in ("design", "documentation"):
+                            node_type = "design"
+                        elif task_type in ("code", "integration", "build", "verification"):
+                            node_type = "coding"
+                        elif task_type in ("test", "unit_test", "integration_test", "system_test"):
+                            node_type = "evaluation"
+                        elif task_type in ("tool", "mcp_tool"):
+                            node_type = "tool"
+                        if node_type:
+                            attrs["node_type"] = node_type
                     self._g.add_node(nid, **attrs)
         if edges:
             for e in edges:
@@ -82,7 +184,13 @@ class DTGGraph:
                 tgt = e.get("to") or e.get("target")
                 if src and tgt:
                     attrs = {k: v for k, v in e.items() if k not in ("from", "to", "source", "target")}
-                    self._g.add_edge(src, tgt, **attrs)
+                    edge_type = (attrs.get("edge_type") or "").lower()
+                    # Treat edges explicitly marked as data edges as data-flow only; they
+                    # should not participate in control-flow topological order.
+                    if edge_type == "data":
+                        self._data_edges.append((src, tgt, attrs))
+                    else:
+                        self._g.add_edge(src, tgt, **attrs)
 
     def add_node(self, node_id: str, **attrs) -> None:
         self._g.add_node(node_id, **attrs)
@@ -112,7 +220,13 @@ class DTGGraph:
                     n["parent_hlig"] = parent_hlig
                     n["language"] = lang
         edges = []
+        # Control-flow edges from the NetworkX DiGraph
         for u, v, data in self._g.edges(data=True):
+            e = {"from": u, "to": v, **_safe_serialize(dict(data))}
+            edges.append(e)
+        # Data-flow edges tracked separately; include them in serialized form so
+        # tools / visualizers can distinguish them (edge_type === "data").
+        for u, v, data in self._data_edges:
             e = {"from": u, "to": v, **_safe_serialize(dict(data))}
             edges.append(e)
         return {
@@ -138,7 +252,10 @@ class HLIGGraph:
     """High-Level Intent Graph - NetworkX DiGraph with optional DTG per node."""
 
     def __init__(self, nodes: list[dict] | None = None, edges: list[dict] | None = None):
+        # _g stores control-flow edges only; data-flow edges can be represented
+        # on edges with edge_type="data" and are kept out of the control graph.
         self._g = nx.DiGraph()
+        self._data_edges: list[tuple[str, str, dict]] = []
         if nodes:
             for n in nodes:
                 nid = n.get("id")
@@ -151,7 +268,13 @@ class HLIGGraph:
                 tgt = e.get("to") or e.get("target")
                 if src and tgt:
                     attrs = {k: v for k, v in e.items() if k not in ("from", "to", "source", "target")}
-                    self._g.add_edge(src, tgt, **attrs)
+                    edge_type = (attrs.get("edge_type") or "").lower()
+                    # Data edges are stored separately; only control edges participate
+                    # in topological order and causal parent calculations.
+                    if edge_type == "data":
+                        self._data_edges.append((src, tgt, attrs))
+                    else:
+                        self._g.add_edge(src, tgt, **attrs)
 
     def get_causal_parents(self, node_id: str) -> list[str]:
         """
@@ -229,7 +352,13 @@ class HLIGGraph:
                 node["dtg"] = dtg
             nodes.append(node)
         edges = []
+        # Control-flow edges from the NetworkX DiGraph
         for u, v, data in self._g.edges(data=True):
+            e = {"from": u, "to": v, **_safe_serialize(dict(data))}
+            edges.append(e)
+        # Data-flow edges are tracked separately (edge_type == "data") and
+        # included for visualization / analysis but excluded from control flow.
+        for u, v, data in getattr(self, "_data_edges", []):
             e = {"from": u, "to": v, **_safe_serialize(dict(data))}
             edges.append(e)
         return {"nodes": nodes, "edges": edges}
@@ -261,7 +390,76 @@ class HLIGGraph:
                 edge_attrs["interface_spec"] = e["interface_spec"]
             if e.get("interface_ref"):
                 edge_attrs["interface_ref"] = e["interface_ref"]
+            if e.get("edge_type") is not None:
+                edge_attrs["edge_type"] = e["edge_type"]
             edges.append({"from": e["from"], "to": e["to"], **edge_attrs})
-        inst = cls(nodes=nodes, edges=edges)
+        node_ids = {str(n["id"]) for n in nodes if isinstance(n, dict) and n.get("id")}
+        control, data_edges = _split_hlig_control_and_data_edges(edges)
+        fixed_control, removed = break_hlig_control_edges_until_dag(control, node_ids)
+        if removed:
+            merged = fixed_control + data_edges
+            hlig["edges"] = merged
+            planner_output["_hlig_cycle_edges_removed"] = removed
+        inst = cls(nodes=nodes, edges=fixed_control + data_edges)
         _raise_if_cycle(inst._g, "HLIG")
         return inst
+
+    @classmethod
+    def from_persisted_dict(cls, data: dict) -> "HLIGGraph":
+        """
+        Rebuild HLIGGraph from JSON saved by SessionManager.save_graph / HLIGGraph.to_dict().
+        Re-attaches embedded DTGs as DTGGraph objects (constructor alone drops dtg from node attrs).
+        """
+        if not isinstance(data, dict):
+            raise TypeError("from_persisted_dict expects a dict")
+        nodes_raw = data.get("nodes") or []
+        edges_raw = data.get("edges") or []
+        if not nodes_raw:
+            raise ValueError("persisted graph has no nodes")
+        dtg_by_nid: dict[str, dict] = {}
+        nodes_slim: list[dict] = []
+        for n in nodes_raw:
+            if not isinstance(n, dict) or not n.get("id"):
+                continue
+            nid = n["id"]
+            nodes_slim.append({k: v for k, v in n.items() if k != "dtg"})
+            dtg = n.get("dtg")
+            if isinstance(dtg, dict) and dtg.get("nodes"):
+                dtg_by_nid[str(nid)] = dtg
+        inst = cls(nodes=nodes_slim, edges=edges_raw)
+        _raise_if_cycle(inst._g, "HLIG")
+        for nid, dtg_data in dtg_by_nid.items():
+            if not inst._g.has_node(nid):
+                continue
+            dtg = DTGGraph.from_dict(dtg_data)
+            inst.set_node_dtg(nid, dtg)
+        return inst
+
+    @classmethod
+    def from_persisted_file(cls, path: str | Path) -> "HLIGGraph":
+        """
+        Load graph from a JSON file path. Accepts:
+        - { \"nodes\": [...], \"edges\": [...] } (graph_*.json)
+        - { \"hlig\": { nodes, edges } } (planner-style)
+        - { \"hlig_graph\": { nodes, edges } } (session bundle)
+        """
+        p = Path(path)
+        if not p.is_file():
+            raise FileNotFoundError(f"Graph file not found: {p}")
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("Graph file must contain a JSON object")
+        payload: dict | None = None
+        if raw.get("nodes"):
+            payload = raw
+        else:
+            for key in ("hlig_graph", "hlig"):
+                inner = raw.get(key)
+                if isinstance(inner, dict) and inner.get("nodes"):
+                    payload = inner
+                    break
+        if payload is None:
+            raise ValueError(
+                "Graph JSON must have top-level 'nodes' or a 'hlig' / 'hlig_graph' object with 'nodes'"
+            )
+        return cls.from_persisted_dict(payload)

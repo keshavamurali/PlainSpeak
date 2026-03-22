@@ -13,6 +13,7 @@ function ChatPage({ runId: initialRunId, onSelectRun }) {
   const [runData, setRunData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState(null);
   const [polling, setPolling] = useState(false);
   const [pendingQuery, setPendingQuery] = useState(null);
   const messagesEndRef = useRef(null);
@@ -61,10 +62,11 @@ function ChatPage({ runId: initialRunId, onSelectRun }) {
   const sendInput = async () => {
     if (!input.trim() || !runId || sending) return;
     const text = input.trim();
-    setInput("");
+    setSendError(null);
     setSending(true);
     try {
       await runs.sendInput(runId, text);
+      setInput("");
       const data = await loadRun(runId);
       if (data?.status === "completed" || data?.status === "failed") {
         setPolling(false);
@@ -79,6 +81,13 @@ function ChatPage({ runId: initialRunId, onSelectRun }) {
       }
     } catch (e) {
       console.error("Send input failed:", e);
+      const msg = e?.message || String(e);
+      setSendError(
+        msg.includes("404") || msg.includes("not found") || msg.includes("not active")
+          ? "This run is no longer accepting input. It may have finished or been restarted. Try starting a new run."
+          : `Could not send: ${msg}`
+      );
+      // Keep the user's text so they can try again or copy it
     } finally {
       setSending(false);
     }
@@ -87,7 +96,7 @@ function ChatPage({ runId: initialRunId, onSelectRun }) {
   useEffect(() => {
     if (runId) {
       loadRun(runId).then((d) => {
-        if (d && (d.status === "running" || d.pending_clarification)) setPolling(true);
+        if (d && (d.status === "running" || d.status === "waiting_input" || d.pending_clarification)) setPolling(true);
       });
     }
   }, [runId]);
@@ -121,6 +130,13 @@ function ChatPage({ runId: initialRunId, onSelectRun }) {
   const pending = runData?.pending_clarification;
   const messages = runData?.messages || [];
   const isCompleted = runData?.status === "completed" || runData?.status === "failed";
+  // Show input form when backend says so, or when status is waiting_input, or when last message is a clarification (race-safe fallback)
+  const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+  const waitingForInput =
+    pending ||
+    runData?.status === "waiting_input" ||
+    (runData?.status === "running" && lastMsg?.clarification === true);
+  const displayPending = pending || (waitingForInput && lastMsg?.clarification ? { message: lastMsg.content } : null);
 
   return (
     <main className="mx-auto max-w-3xl flex flex-col h-[calc(100vh-72px)] bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
@@ -193,32 +209,45 @@ function ChatPage({ runId: initialRunId, onSelectRun }) {
       </div>
 
       <div className="flex-shrink-0 border-t border-slate-200 bg-white p-4">
-        {pending ? (
+        {waitingForInput ? (
           <div className="flex flex-col gap-3">
-            {pending.message && (
+            {(displayPending?.message || pending?.message) && (
               <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2">
                 <p className="text-xs font-medium text-amber-800 mb-1">Please answer:</p>
-                <p className="text-sm text-amber-900 whitespace-pre-wrap">{pending.message}</p>
+                <p className="text-sm text-amber-900 whitespace-pre-wrap">{displayPending?.message ?? pending?.message}</p>
               </div>
             )}
-            <div className="flex gap-2 items-end">
+            {sendError && (
+              <div className="rounded-lg bg-red-50 border border-red-200 px-3 py-2 text-sm text-red-800">
+                {sendError}
+              </div>
+            )}
+            <form
+              className="flex gap-2 items-end"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (input.trim() && !sending) sendInput();
+              }}
+            >
             <textarea
               rows={3}
               className="input flex-1 resize-y min-h-[60px]"
               placeholder="Type your response (multiple lines). Press Send when ready."
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value);
+                if (sendError) setSendError(null);
+              }}
               disabled={sending}
             />
             <button
-              type="button"
+              type="submit"
               className="btn-primary"
-              onClick={sendInput}
               disabled={sending || !input.trim()}
             >
               {sending ? "Sending…" : "Send"}
             </button>
-            </div>
+            </form>
           </div>
         ) : !runId ? (
           <div className="flex gap-2 items-end">

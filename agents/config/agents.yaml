@@ -58,8 +58,8 @@ steps:
     description: Review HLIG and DTGs for correctness, dependencies, inconsistencies
 
   - name: coder
-    prompt_file: prompts/coder.md
-    description: Implement code per DTG node based on design
+    prompt_file: prompts/code_generator.md
+    description: Implement code per DTG node based on design (same prompt as DTGArtifactGenerator)
 
   - name: code_reviewer
     prompt_file: prompts/code_reviewer.md

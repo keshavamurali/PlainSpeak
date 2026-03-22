@@ -11,12 +11,30 @@ from core.plan_graph import PlanGraph
 from core.hlig_dtg_graphs import HLIGGraph, DTGGraph, GraphCycleError
 
 try:
-    from core.debug_logger import log_pipeline_event, log_user_input, get_session_usage, log_token_summary, CostLimitExceeded
+    from core.debug_logger import (
+        log_pipeline_event,
+        log_user_input,
+        get_session_usage,
+        log_token_summary,
+        CostLimitExceeded,
+        log_graph_execution_trace,
+        sanitize_plan_dict_for_trace,
+    )
 except ImportError:
     log_pipeline_event = log_user_input = lambda *a, **kw: None
     get_session_usage = lambda _: {}
     log_token_summary = lambda *a, **kw: None
     CostLimitExceeded = Exception  # noqa: type for isinstance check
+    log_graph_execution_trace = lambda *a, **kw: None
+    sanitize_plan_dict_for_trace = lambda x: {}
+
+try:
+    from core.dtg_artifact_generator import LocalBuildFailedError
+except ImportError:
+    class LocalBuildFailedError(RuntimeError):
+        """Stub when artifact generator is unavailable."""
+
+        pass
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SESSIONS_BASE = PROJECT_ROOT / "session_log" / "sessions"
@@ -282,7 +300,25 @@ class AgentRunner:
                     if str(status).lower() in ("failure", "failed", "error"):
                         build_failed = True
                     log_pipeline_event(ctx.session_id, "build_triggered", {"hlig_id": nid, "build_status": status})
+                    # Persist MCP build output to build.log for debugging
+                    outputs_path = ctx.globals_schema.get("artifact_outputs_path")
+                    if outputs_path:
+                        hlig_dir = Path(outputs_path) / str(nid)
+                        if hlig_dir.is_dir():
+                            log_path = hlig_dir / "build.log"
+                            ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                            block = f"\n{'='*60}\n[{ts}] [MCP build] {status}\n{'='*60}\n"
+                            for key in ("stdout", "stderr"):
+                                val = parsed.get(key)
+                                if val:
+                                    block += f"--- {key} ---\n{val}\n"
+                            try:
+                                with open(log_path, "a", encoding="utf-8") as f:
+                                    f.write(block)
+                            except Exception:
+                                pass
                 except json.JSONDecodeError:
+                    build_failed = True
                     log_pipeline_event(ctx.session_id, "build_triggered", {"hlig_id": nid, "output": text[:500]})
             except Exception as e:
                 build_failed = True
@@ -383,6 +419,8 @@ class AgentRunner:
             except Exception as e:
                 log_pipeline_event(ctx.session_id, "artifact_generation_error", {"error": str(e)})
                 ctx.add_artifact("coder", {"output": f"Error: {e}", "error": str(e)})
+                if isinstance(e, LocalBuildFailedError):
+                    raise
                 if isinstance(e, CostLimitExceeded):
                     raise
             return ctx
@@ -488,6 +526,14 @@ class AgentRunner:
         ctx.globals_schema.setdefault("original_query", ctx.get_state("query", ""))
 
         log_pipeline_event(ctx.session_id, "run_started", {"query": ctx.get_state("query", "")})
+        log_graph_execution_trace(
+            ctx.session_id,
+            "run_started",
+            {
+                "pipeline_steps": list(step_names),
+                "query_preview": str(ctx.get_state("query", ""))[:500],
+            },
+        )
 
         # Phase 1: Get plan from Planner (supports clarification loop per prompts/planner.md)
         plan_dict = None
@@ -539,6 +585,13 @@ class AgentRunner:
             if planner_out.get("hlig"):
                 try:
                     hlig_graph = HLIGGraph.from_planner_hlig(planner_out)
+                    removed_cycles = planner_out.pop("_hlig_cycle_edges_removed", None)
+                    if removed_cycles:
+                        log_pipeline_event(
+                            ctx.session_id,
+                            "hlig_cycles_auto_removed",
+                            {"removed_edges": removed_cycles},
+                        )
                     if hlig_graph:
                         ctx.hlig_graph = hlig_graph
                 except GraphCycleError as e:
@@ -551,11 +604,19 @@ class AgentRunner:
                     if retry_count < 1:
                         ctx.globals_schema["hlig_cycle_retry_count"] = retry_count + 1
                         existing = ctx.globals_schema.get("user_clarification", "")
+                        cycle_detail = ""
+                        if getattr(e, "cycle_edges", None):
+                            cycle_detail = f" Problematic edges (remove at least one or use a single direction): {e.cycle_edges}."
                         ctx.globals_schema["user_clarification"] = (
-                            f"{existing}\n\n[System: The previous HLIG graph contained a cycle: {e}. "
-                            "Please output a new HLIG with edges that form a DAG (no circular dependencies).]".strip()
+                            f"{existing}\n\n[System: The previous HLIG graph contained a cycle: {e}.{cycle_detail} "
+                            "Edges must form a DAG: do not add both A→B and B→A. Use one directed edge for each dependency "
+                            "(e.g. backend → frontend for API consumption).]".strip()
                             if existing
-                            else f"[System: The HLIG graph contained a cycle: {e}. Please output an HLIG with edges that form a DAG (no circular dependencies).]"
+                            else (
+                                f"[System: The HLIG graph contained a cycle: {e}.{cycle_detail} "
+                                "Edges must form a DAG: do not add both A→B and B→A. Use one directed edge per dependency "
+                                "(e.g. backend → frontend for API consumption).]"
+                            )
                         )
                         continue
                     raise
@@ -564,6 +625,14 @@ class AgentRunner:
 
         plan = PlanGraph.from_dict(plan_dict)
         ctx.plan_graph = plan
+        log_graph_execution_trace(
+            ctx.session_id,
+            "plan_initialized",
+            {
+                "has_hlig_graph": ctx.hlig_graph is not None,
+                **sanitize_plan_dict_for_trace(plan.to_dict()),
+            },
+        )
 
         # Mark planner done when we already ran it (full pipeline with HLIG)
         if ctx.hlig_graph and "designer" in step_names and "design_reviewer" in step_names:
@@ -576,6 +645,7 @@ class AgentRunner:
                 plan.mark_done(planner_node_id, output=planner_artifact.get("output") if isinstance(planner_artifact, dict) else planner_artifact)
 
         log_pipeline_event(ctx.session_id, "phase2_dag", {"plan": plan_dict})
+        log_graph_execution_trace(ctx.session_id, "phase2_dag_started", {"message": "executing plan graph"})
 
         # Phase 2: DAG execution
         bus = _get_event_bus()
@@ -591,11 +661,29 @@ class AgentRunner:
                     agent_name = node_data.get("agent", "")
                     if agent_name == "System" or not agent_name:
                         plan.mark_done(node_id)
+                        log_graph_execution_trace(
+                            ctx.session_id,
+                            "node_skipped",
+                            {"node_id": node_id, "agent": agent_name or "(empty)", "reason": "system_or_no_agent"},
+                        )
                         continue
 
                     plan.mark_running(node_id)
                     log_pipeline_event(ctx.session_id, "node_started", {"node_id": node_id, "agent": agent_name})
+                    log_graph_execution_trace(
+                        ctx.session_id,
+                        "node_started",
+                        {
+                            "node_id": node_id,
+                            "agent": agent_name,
+                            "description": str(node_data.get("description", ""))[:300],
+                            "reads": node_data.get("reads"),
+                            "writes": node_data.get("writes"),
+                        },
+                    )
                     try:
+                        # Record node start in graph_state for observability.
+                        ctx.graph_state.record_start(node_id, agent_name, inputs={})
                         phase_ctx = self._run_pipeline_phase(agent_name, node_id, node_data, ctx, steps)
                         if phase_ctx is not None:
                             ctx = phase_ctx
@@ -608,6 +696,11 @@ class AgentRunner:
                             out_val = output
                         if _is_clarification_request(out_val) and wait_for_input:
                             plan.get_node(node_id)["status"] = "waiting_input"
+                            log_graph_execution_trace(
+                                ctx.session_id,
+                                "node_waiting_input",
+                                {"node_id": node_id, "agent": agent_name},
+                            )
                             if on_step_complete:
                                 try:
                                     on_step_complete(ctx)
@@ -642,6 +735,18 @@ class AgentRunner:
                             plan.mark_done(node_id, output=out_val)
                             self._extract_writes(ctx, node_data, out_val)
 
+                        nd = plan.get_node(node_id) or {}
+                        log_graph_execution_trace(
+                            ctx.session_id,
+                            "node_completed",
+                            {
+                                "node_id": node_id,
+                                "agent": agent_name,
+                                "status": nd.get("status"),
+                                "execution_time_s": nd.get("execution_time"),
+                            },
+                        )
+
                         spec = steps.get(agent_name, {})
                         prompt_file = spec.get("prompt_file")
                         agent = BaseAgent(
@@ -652,6 +757,8 @@ class AgentRunner:
                         )
                         ctx.record_agent_run(agent_name, agent)
                         log_pipeline_event(ctx.session_id, "node_completed", {"node_id": node_id, "agent": agent_name})
+                        # Record successful completion in graph_state.
+                        ctx.graph_state.record_end(node_id, outputs={"output": out_val}, error=None)
 
                         if on_step_complete:
                             try:
@@ -675,10 +782,33 @@ class AgentRunner:
                                 pass
                     except Exception as e:
                         plan.mark_failed(node_id, error=str(e))
+                        # Record failure in graph_state before bubbling up.
+                        ctx.graph_state.record_end(node_id, outputs={}, error=str(e))
+                        fd = plan.get_node(node_id) or {}
+                        log_graph_execution_trace(
+                            ctx.session_id,
+                            "node_failed",
+                            {
+                                "node_id": node_id,
+                                "agent": agent_name,
+                                "error_type": type(e).__name__,
+                                "error": str(e)[:2000],
+                                "status": fd.get("status"),
+                            },
+                        )
                         raise
         except CostLimitExceeded:
             # Log final cost and run_completed before re-raising so logs show why run stopped
             totals = get_session_usage(ctx.session_id)
+            log_graph_execution_trace(
+                ctx.session_id,
+                "run_stopped",
+                {
+                    "reason": "cost_limit_exceeded",
+                    "total_cost_usd": totals.get("cost_usd", 0) if totals else 0,
+                    "total_tokens": totals.get("total_tokens", 0) if totals else 0,
+                },
+            )
             if totals:
                 log_token_summary(ctx.session_id, totals)
                 log_pipeline_event(
@@ -694,6 +824,29 @@ class AgentRunner:
 
         # Log session-level token/cost summary and run completed with total cost
         totals = get_session_usage(ctx.session_id)
+        _final_nodes: list[dict] = []
+        for nid, data in plan.nodes():
+            if nid == PlanGraph.ROOT:
+                continue
+            _final_nodes.append(
+                {
+                    "node_id": nid,
+                    "agent": data.get("agent"),
+                    "status": data.get("status"),
+                    "execution_time_s": data.get("execution_time"),
+                    "error": (str(data.get("error"))[:500] if data.get("error") else None),
+                }
+            )
+        log_graph_execution_trace(
+            ctx.session_id,
+            "run_finished",
+            {
+                "all_done": plan.all_done(),
+                "nodes": _final_nodes,
+                "total_cost_usd": totals.get("cost_usd", 0) if totals else 0,
+                "total_tokens": totals.get("total_tokens", 0) if totals else 0,
+            },
+        )
         if totals:
             log_token_summary(ctx.session_id, totals)
             log_pipeline_event(
