@@ -69,6 +69,73 @@ _DESIGN_CTX = _ctx_limit("DESIGN_CONTEXT_MAX_CHARS", 2000)
 _CODE_CTX = _ctx_limit("CODE_CONTEXT_MAX_CHARS", 1500)
 
 
+def _truncate_retry_project_files(files: dict[str, str]) -> dict[str, str]:
+    """
+    Cap total size of previous_attempt_files sent on build retry (env BUILD_RETRY_FILES_MAX_TOTAL_CHARS).
+    Prioritize Cargo.toml, package.json, then other paths alphabetically. Use 0 for unlimited.
+    """
+    max_total = _ctx_limit("BUILD_RETRY_FILES_MAX_TOTAL_CHARS", 100_000)
+    if max_total <= 0 or not files:
+        return files
+    keys = sorted(
+        files.keys(),
+        key=lambda k: (
+            0 if k == "Cargo.toml" or k.endswith("/Cargo.toml") else 1 if k == "package.json" else 2,
+            k,
+        ),
+    )
+    out: dict[str, str] = {}
+    n = 0
+    for k in keys:
+        v = files[k]
+        if n + len(v) <= max_total:
+            out[k] = v
+            n += len(v)
+        else:
+            room = max_total - n
+            if room > 800:
+                out[k] = v[:room] + "\n/* ... truncated (BUILD_RETRY_FILES_MAX_TOTAL_CHARS) ... */\n"
+            break
+    return out
+
+
+def _snapshot_project_files_for_retry(
+    hlig_dir: Path,
+    framework: str,
+    last_generated: dict[str, str],
+) -> dict[str, str]:
+    """
+    Build full-text snapshot for the next LLM attempt after a failed build.
+    Prefer on-disk content (matrix post-processing may have edited manifests).
+    Always include Cargo.toml / package.json when present.
+    """
+    merged: dict[str, str] = {}
+    for rel, content in last_generated.items():
+        fp = hlig_dir / rel
+        if fp.is_file():
+            try:
+                merged[rel] = fp.read_text(encoding="utf-8")
+            except OSError:
+                merged[rel] = content
+        else:
+            merged[rel] = content
+    if framework == "rust-tauri":
+        cargo = hlig_dir / "Cargo.toml"
+        if cargo.is_file():
+            try:
+                merged["Cargo.toml"] = cargo.read_text(encoding="utf-8")
+            except OSError:
+                pass
+    elif framework == "node-react":
+        pj = hlig_dir / "package.json"
+        if pj.is_file():
+            try:
+                merged["package.json"] = pj.read_text(encoding="utf-8")
+            except OSError:
+                pass
+    return _truncate_retry_project_files(merged)
+
+
 def _truncate_design(s: str) -> str:
     return s[:_DESIGN_CTX] if _DESIGN_CTX > 0 else s
 
@@ -235,6 +302,10 @@ def _dependency_rules_text(framework: str, matrix: dict) -> str:
         if isinstance(ds, str) and ds.strip():
             lines.append("### Diesel + SQLite (required when using Diesel with SQLite)")
             lines.append(ds.strip())
+        ap = section.get("argon2_password_rules")
+        if isinstance(ap, str) and ap.strip():
+            lines.append("### Argon2 / password-hash (required when using argon2 or password hashing)")
+            lines.append(ap.strip())
     deps = section.get("dependencies")
     if deps and isinstance(deps, dict):
         lines.append("Use these dependency versions (or compatible); do not invent versions or features:")
@@ -597,9 +668,27 @@ def _parse_build_failure_hints(stderr: str, framework: str) -> str:
             hints.append(
                 "Diesel migrations: create `migrations/` next to Cargo.toml with dated subfolders and up.sql; use embed_migrations!(\"migrations\") not ../migrations. Emit migration files whenever you emit embed_migrations! or MIGRATIONS will be missing."
             )
+        if ("embed_migrations" in err and "expected one of `!` or `::`" in err) or (
+            "embed_migrations!();" in err.replace(" ", "")
+        ):
+            hints.append(
+                "Diesel: use `use diesel_migrations::embed_migrations;` (not `extern crate`). Call `embed_migrations!(\"migrations\")` with **no semicolon** after the macro (it expands to items). Never `embed_migrations!()` with empty parentheses. See diesel_sqlite_rules in implementation_brief."
+            )
         if "not found in this scope" in err and "migrations" in err:
             hints.append(
                 "embed_migrations! failed or is missing — fix migrations directory path and ensure the macro succeeds so `MIGRATIONS` exists."
+            )
+        if "osrng" in err.replace("_", "") and ("argon2" in err or "password_hash" in err or "password-hash" in err):
+            hints.append(
+                "Argon2/password-hash: add `rand_core` with features [\"getrandom\"] (or `rand` with OsRng) to Cargo.toml; use `use rand_core::OsRng` (or `rand::rngs::OsRng`). Do not use a broken `password_hash::rand_core::OsRng` import. See argon2_password_rules in implementation_brief."
+            )
+        if "salt" in err and "hash_password" in err and ("intosalt" in err.replace(" ", "").replace("'", "") or "into<salt" in err):
+            hints.append(
+                "Argon2: `hash_password` second argument must be a salt (e.g. `let salt = SaltString::generate(&mut OsRng);` then `.hash_password(password.as_bytes(), &salt)`), not `&mut OsRng`. See argon2_password_rules."
+            )
+        if "password_hash::error" in err or ("stderror" in err.replace("_", "") and "password_hash" in err):
+            hints.append(
+                "password_hash::Error with anyhow: use `.map_err(|e| anyhow::anyhow!(\"{e:?}\"))?` instead of bare `?`. Do not put anyhow::Error inside Box<dyn StdError> for Diesel. See argon2_password_rules."
             )
         if ("similar names, but are actually distinct types" in err and "diesel::r2d2" in err and "r2d2" in err) or (
             "expected `diesel::r2d2::error`" in err.replace("`", "").lower()
@@ -711,6 +800,46 @@ def _format_cargo_diesel_dep(diesel_spec: Any) -> str | None:
     if diesel_spec:
         return f'diesel = "{str(diesel_spec).strip()}"'
     return None
+
+
+def _normalize_rust_embed_migrations(hlig_dir: Path) -> None:
+    """
+    Fix common LLM mistakes around Diesel embed_migrations!:
+    - Replace legacy #[macro_use] extern crate diesel_migrations; with use diesel_migrations::embed_migrations;
+    - Remove trailing semicolon after embed_migrations!("...") — the macro expands to items; ';' breaks parsing.
+    """
+    src = hlig_dir / "src"
+    if not src.is_dir():
+        return
+    for fp in src.rglob("*.rs"):
+        if not fp.is_file():
+            continue
+        try:
+            text = fp.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        orig = text
+        text = re.sub(
+            r"#\[macro_use\]\s*\n\s*extern\s+crate\s+diesel_migrations\s*;",
+            "use diesel_migrations::embed_migrations;",
+            text,
+            flags=re.MULTILINE,
+        )
+        text = re.sub(
+            r"#\[macro_use\]\s*extern\s+crate\s+diesel_migrations\s*;",
+            "use diesel_migrations::embed_migrations;",
+            text,
+        )
+        text = re.sub(
+            r'embed_migrations!\(\s*"([^"]+)"\s*\)\s*;',
+            r'embed_migrations!("\1")',
+            text,
+        )
+        if text != orig:
+            try:
+                fp.write_text(text, encoding="utf-8")
+            except OSError:
+                pass
 
 
 def _apply_dependency_matrix_to_cargo(hlig_dir: Path, matrix: dict) -> None:
@@ -1185,11 +1314,13 @@ class DTGArtifactGenerator:
         compile_errors: str | None = None,
         design_docs_available: bool = True,
         implementation_brief: str | None = None,
+        previous_attempt_files: dict[str, str] | None = None,
     ) -> dict[str, str]:
         """
         Generate code files for a DTG code node. Returns {path: content}.
         CVP: causal_path and causal_parent_context restrict/annotate context (Markov blanket).
         When compile_errors is set, the model should fix the code to resolve the build output.
+        previous_attempt_files: full file contents from the last failed build (plus manifests); required for targeted fixes.
         implementation_brief: full design-based prompt text for clarity; use when provided.
         """
         prompt = self._load_prompt("code_generator")
@@ -1213,6 +1344,8 @@ class DTGArtifactGenerator:
             input_data["interface_definitions"] = interface_definitions
         if compile_errors:
             input_data["compile_errors"] = compile_errors
+        if previous_attempt_files:
+            input_data["previous_attempt_files"] = previous_attempt_files
         if implementation_brief:
             input_data["implementation_brief"] = implementation_brief
         try:
@@ -1410,6 +1543,7 @@ path = "src/main.rs"
         deps = node.get("dependencies") or []
         iface_defs = _get_interfaces_for_hlig(hlig_graph, hlig_id) if hlig_graph else None
         compile_errors: str | None = None
+        previous_attempt_files: dict[str, str] | None = None
         last_err = ""
         max_extra = _per_node_build_max_retries()
         for attempt in range(max_extra + 1):
@@ -1426,6 +1560,7 @@ path = "src/main.rs"
                 compile_errors=compile_errors,
                 design_docs_available=design_docs_available,
                 implementation_brief=impl_brief,
+                previous_attempt_files=previous_attempt_files,
             )
             for rel_path, content in files.items():
                 full_path = hlig_dir / rel_path
@@ -1445,6 +1580,7 @@ path = "src/main.rs"
             matrix = _load_dependency_matrix()
             if framework == "rust-tauri":
                 _apply_dependency_matrix_to_cargo(hlig_dir, matrix)
+                _normalize_rust_embed_migrations(hlig_dir)
             elif framework == "node-react":
                 _apply_dependency_matrix_to_node_project(hlig_dir, matrix)
             success, out, err = _run_local_build(hlig_dir, framework)
@@ -1462,7 +1598,11 @@ path = "src/main.rs"
             last_err = err or out or ""
             raw_errors = f"Previous build failed.\nstdout:\n{out}\nstderr:\n{err}"
             hints = _parse_build_failure_hints(err or out, framework)
-            compile_errors = raw_errors + ("\n\n" + hints if hints else "")
+            compile_errors = raw_errors + ("\n\nHints to fix:\n" + hints if hints else "")
+            if files:
+                previous_attempt_files = _snapshot_project_files_for_retry(hlig_dir, framework, files)
+            else:
+                previous_attempt_files = None
             log_pipeline_event(
                 session_id,
                 "local_build_retry",
@@ -1471,6 +1611,7 @@ path = "src/main.rs"
                     "dtg_node": nid,
                     "attempt": attempt + 1,
                     "stderr_preview": last_err[:500],
+                    "previous_files_keys": list(previous_attempt_files.keys()) if previous_attempt_files else [],
                 },
             )
         if _abort_on_local_build_failure():
