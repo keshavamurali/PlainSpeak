@@ -1,116 +1,176 @@
 # PlainSpeak
-Build Softwares using Natural Language instructions
 
-## LLM Setup
+**PlainSpeak** turns natural-language software requests into **structured graphs** and **generated artifacts** (design specs, code, tests) using a pipeline of LLM agents. You describe what you want in plain language; the system builds a **High-Level Intent Graph (HLIG)** of subsystems, expands each subsystem into a **Detailed Task Graph (DTG)** of tasks, then runs designers, coders, reviewers, and optional local builds so outputs land under `session_log/` for inspection and iteration.
 
-PlainSpeak uses an LLM for agents (planner, coder, reviewer). Configure via:
+The project is aimed at **LLM-agnostic**, **deterministic** graph formats and **traceable** runs (causal edges, dependency matrix pins, build logs) so generated code stays aligned with a single specification.
+
+---
+
+## Language specification (HLIG / DTG)
+
+The full formal schema—node/edge shapes, `task_type`, CVP (`causal`), interface specs, control vs data flow, and validation rules—is defined here:
+
+**[language_readme.md](language_readme.md)** — *HLIG/DTG Language Specification* (authoritative reference).
+
+Use that document whenever you need exact field names, JSON shapes, or graph semantics beyond this README.
+
+---
+
+## How to use PlainSpeak
+
+### 1. Prerequisites
+
+- **Python 3.10+** with **[uv](https://github.com/astral-sh/uv)** (recommended) for dependencies  
+- **Node.js** (for the web UI in `frontend/`)  
+- An **LLM** — default is Google **Gemini**; **Ollama** is supported for local models (see below)
+
+### 2. Configure the LLM
+
+PlainSpeak uses an LLM for agents (planner, designer, coder, reviewers, etc.).
 
 **Gemini** (default):
+
 ```bash
 export GEMINI_API_KEY="your-key"
 # Or create .env with GEMINI_API_KEY=...
 ```
 
 **Ollama** (local):
+
 ```bash
-# Set in config/settings.json or env:
+# Set in config/settings.json or environment, e.g.:
 # PLAINSPEAK_MODEL_PROVIDER=ollama
 # PLAINSPEAK_MODEL=phi4
-ollama run phi4  # Ensure model is pulled
+ollama run phi4   # Ensure the model is pulled
 ```
 
-## Quick Start
+### 3. Run the API (backend)
 
-### Backend (FastAPI)
+From the repository root:
+
 ```bash
 uv sync
-uv run python api.py
+uv run uvicorn api:app --host 0.0.0.0 --port 8000
+# Alternative:
+# uv run python api.py
 ```
 
-### Frontend
+The HTTP API exposes runs (e.g. create a run, stream events, send clarification). Default pipeline and agent steps are configured in **`agents/config/agents.yaml`**.
 
-**Development** (Vite dev server with API proxy):
+### 4. Run the web UI (frontend)
+
+**Development** (Vite dev server, typically proxying to the API):
+
 ```bash
 cd frontend && npm install && npm run dev
 ```
-Open http://localhost:5173
 
-**Production** (Node server serving built assets):
+Open **http://localhost:5173**
+
+**Production-style** (build + static serve):
+
 ```bash
 cd frontend && npm install && npm run build && npm run serve
 ```
-Open http://localhost:5173
 
-## External Dependencies (DB, Auth, Storage)
+### 5. Create a run via the API
 
-PlainSpeak auto-provisions mock config for external interfaces declared in HLIG nodes (`DB`, `Auth`, `Storage`, `Filesystem`, `message`, `API`). After artifact generation, it creates:
+Example: **`POST /api/runs`** with a JSON body:
 
-- **`.env`** and **`.env.test`** – Mock/local URLs (SQLite, local paths, dev secrets)
-- **`data/`, `storage/`** – Directories for SQLite and file storage
+```json
+{
+  "query": "Describe your project in natural language…",
+  "pipeline": "hlig_no_design_docs"
+}
+```
 
-The build sandbox loads these env vars when building and running. Use SQLite for DB and local paths for storage in generated code so builds/tests run without real services.
+- **`query`** — User request (required).  
+- **`pipeline`** — Optional. If omitted, the default in `agents/config/agents.yaml` is used (e.g. `hlig_no_design_docs`). Other examples: `hlig_full`, `minimal`.
 
-For real Postgres/Redis/MinIO, use `provision_dependencies` MCP tool with `use_docker_compose: true` to generate `docker-compose.test.yml`, then run `docker compose -f docker-compose.test.yml up -d` before build.
+Session artifacts, graphs, and generated code are written under **`session_log/sessions/…`** (see `session/manager.py` and your run id).
 
-## Pipeline (HLIG Full)
+### 6. Pipelines and cost
 
-The default pipeline runs 9 agents in order:
+- **`hlig_full`** — Planner → Designer → Design doc generator → Design reviewer → Coder → … (full HLIG pipeline).  
+- **`hlig_no_design_docs`** — Skips separate design-doc LLM steps; faster / lower cost (common default).  
+- Pipelines are listed in **`agents/config/agents.yaml`** under `pipelines:`.
 
-1. **Planner** — Build HLIG from user requirements
-2. **Designer** — Build DTG for each HLIG node
-3. **Design Reviewer** — Review graphs for correctness, dependencies, inconsistencies
-4. **Coder** — Generate design docs and code per DTG node
-5. **Code Reviewer** — Review generated code
-6. **Builder** — Build generated code via MCP sandbox
-7. **Unit Tester** — Generate and run unit tests
-8. **Integration Tester** — Test interfaces between HLIG nodes
-9. **System Tester** — Full system-level testing
+For env toggles (local `cargo`/`npm` checks, truncation, cost limits), see **`prompts/README.md`** and the **Cost Optimizations** section below.
 
-Set `default_pipeline: default` in `agents/config/agents.yaml` to use the shorter pipeline (planner, clarification, coder, reviewer).
+### 7. Where to look next
 
-## Design Specs (LLM-Oriented)
+| Topic | Location |
+|--------|----------|
+| HLIG/DTG JSON schema & rules | **[language_readme.md](language_readme.md)** |
+| Agent steps & pipeline names | `agents/config/agents.yaml` |
+| Pinned dependency / codegen rules | `agents/config/dependency_matrix.yaml` |
+| Codegen / local build env vars | `prompts/README.md` |
+| Tools / scripts | `tools/README.md` |
 
-Design nodes produce **canonical design specifications** in JSON format for LLM consumption (not human documentation). Stored as `designs/DTG-X-Y_Title.json` with schema:
+---
 
-- `type`: `"design_spec"`
-- `architecture`: components, data_flow, key_decisions
-- `implementation_instructions`: ordered, concrete steps for code-generating LLMs
-- `constraints`, `outputs`, `dependencies`
+## External dependencies (DB, Auth, Storage)
 
-Downstream agents (code generator, test generator) parse this JSON and follow the instructions precisely.
+PlainSpeak can auto-provision mock config for external interfaces declared on HLIG nodes (`DB`, `Auth`, `Storage`, `Filesystem`, `API`, etc.). After artifact generation, you may see:
 
-## Cost Optimizations
+- **`.env`** / **`.env.test`** — mock URLs (e.g. SQLite, local paths)  
+- **`data/`**, **`storage/`** — local storage dirs  
 
-To reduce LLM cost (especially with Gemini):
+For real services, see project notes on `provision_dependencies` / Docker Compose in your deployment docs.
 
-- **`hlig_no_design_docs` pipeline** — Skips design doc generation and design review (~50% fewer LLM calls). Set `default_pipeline: hlig_no_design_docs` or pass `pipeline: "hlig_no_design_docs"` when creating a run.
-- **Pipeline selection per run** — POST `/api/runs` accepts `{ "query": "...", "pipeline": "hlig_no_design_docs" }`. Omit `pipeline` to use the default.
-- **Coarser DTG** — In `agents/config/agents.yaml`, the designer step has `max_design_nodes: 4` and `max_code_nodes: 8` to limit DTG granularity (fewer nodes = fewer LLM calls).
-- **Context truncation** — Env vars `DESIGN_CONTEXT_MAX_CHARS` (default 2000) and `CODE_CONTEXT_MAX_CHARS` (default 1500) limit dependency context size. Use `0` for no truncation.
-- **Early exit on build failure** — If the builder phase fails, unit/integration/system testers are skipped to avoid wasted LLM calls.
-- **Cost limit** — `COST_LIMIT_USD` (default 0.25) stops the run when exceeded. Set to `0` to disable.
+---
+
+## Pipeline overview (example: HLIG full)
+
+A typical full pipeline runs agents in order, for example:
+
+1. **Planner** — Builds HLIG from the user request  
+2. **Designer** — Builds a DTG per HLIG node  
+3. **Design doc generator** — (if pipeline includes it) design JSON for design-type DTG nodes  
+4. **Design reviewer** — Reviews graphs  
+5. **Coder** — Generates design artifacts and code per DTG  
+6. **Code reviewer** — Reviews generated code  
+7. **Builder** — Builds via MCP sandbox (if configured)  
+8. **Unit / integration / system testers** — As configured  
+
+Set `default_pipeline` in `agents/config/agents.yaml` or pass **`pipeline`** on the run request to choose a shorter graph (e.g. `minimal`).
+
+---
+
+## Design specs (LLM-oriented)
+
+Design-type nodes can produce **canonical `design_spec` JSON** (architecture, `implementation_instructions`, constraints). Downstream codegen consumes that JSON. Paths often look like `…/designs/<node>_<title>.json`. See **[language_readme.md](language_readme.md)** for structure.
+
+---
+
+## Cost optimizations
+
+- **`hlig_no_design_docs`** — Fewer LLM steps; set as `default_pipeline` or pass in the run body.  
+- **`pipeline`** per run — `POST /api/runs` with `"pipeline": "hlig_no_design_docs"`.  
+- **Designer limits** — `max_design_nodes` / `max_code_nodes` in `agents.yaml` under the designer step.  
+- **Context truncation** — `DESIGN_CONTEXT_MAX_CHARS`, `CODE_CONTEXT_MAX_CHARS`, `BUILD_RETRY_FILES_MAX_TOTAL_CHARS` (see `prompts/README.md`).  
+- **`COST_LIMIT_USD`** — Stops the run when exceeded; set to `0` to disable.  
+
+---
 
 ## CVP (Causal Visual Programming)
 
-PlainSpeak integrates causal semantics to reduce hallucinations and improve robustness:
+PlainSpeak attaches **causal** semantics to some HLIG edges, scopes agent context to causal parents where applicable, and can emit **`causal_path.json`** in artifact dirs for traceability. Details and edge rules are specified in **[language_readme.md](language_readme.md)** (CVP sections).
 
-- **Causal edges**: HLIG edges may set `causal: true` to denote direct causation (Planner prompt).
-- **Markov blanket scoping**: Agent context is restricted to outputs from causal parents only.
-- **Causal path traceability**: Each HLIG output directory includes `causal_path.json` listing the chain of nodes that led to it (for audit and explainability).
+---
 
-See `language_readme.md` for the full schema.
+## Requirements / roadmap
 
-# Requirements
-1. Need to be able to take the Natural Language Input and understand the requirement
-2. Ask for Clarification, to understand what user means by the query, as needed.
-3. Create a high level Plan Graph. E.g: "Create a Backend Server, a Front End, Business Logic part, all connected together with APIs".
-4. Get confirmation from the user to make sure that it is correct.
-5. For each of the nodes, create a detailed graph. It can be a sub-graph of the main graph.
-6. Attach the Test step for each of the sub-graphs (Unit test)
-7. Attach the Test case node (Integration test cases) to the end of the graph.
-8. If any node fails, add the re-plan
-9. Display of the Graph in each step, and ability to track what is going on.
-10. Ability to edit and re-run the part of the graphs.
-11. Automated Dependency installer for Libraries
-12. Clearly provide what is possible and what is not.
+High-level goals for the project (not all may be implemented in a single release):
 
+1. Take natural language and infer requirements  
+2. Ask clarifications when needed  
+3. Build a high-level plan graph (e.g. backend, frontend, APIs)  
+4. Confirm with the user where appropriate  
+5. Expand each subsystem into a detailed task graph  
+6. Attach unit-test and integration-test steps to the graph  
+7. Re-plan or retry when nodes fail  
+8. Visualize / track graph state and progress  
+9. Edit and re-run parts of the graph  
+10. Automated dependency installation where applicable  
+11. Clearly document what is supported vs out of scope  
