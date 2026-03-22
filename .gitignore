@@ -1,0 +1,59 @@
+# Debug data and session details
+debug_logs/
+session_log/sessions/**
+!session_log/sessions/.gitkeep
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/package-lock.json
+frontend/.vite/
+.npm
+.yarn-integrity
+
+# Rust / Tauri
+**/target/
+Cargo.lock
+*.rs.bk
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Misc
+routers/Untitled
+
+# IDE and OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-*
+
+# Test and coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# uv
+.uv/

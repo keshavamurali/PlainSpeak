@@ -1,0 +1,14 @@
+{
+  "browser": {
+    "command": "uv",
+    "args": ["run", "server_browser.py"],
+    "type": "local-script",
+    "enabled": false
+  },
+  "build_sandbox": {
+    "command": "uv",
+    "args": ["run", "server_build_sandbox.py"],
+    "type": "local-script",
+    "enabled": true
+  }
+}
