@@ -13,14 +13,14 @@ rust-tauri:
     - tauri-build version is separate from tauri; use the exact tauri-build version listed below (e.g. 2.5), not a version matching tauri.
     - Do not create both src/X.rs and src/X/mod.rs for the same module; use one (either a single file or a directory with mod.rs).
     - Use semicolons after statement expressions where required (e.g. before Ok(()) or the next statement).
-    - **HTTP server crates:** Prefer **Actix Web** with the pinned `actix-web` / `actix-files` versions below, or **Axum** with the pinned `axum` version. Do not mix incompatible tower/actix versions; use only one framework per binary unless the design explicitly splits services.
+    - **HTTP server crates:** Prefer **Actix Web** with the pinned `actix-web` / `actix-files` versions below, or **Axum** with the pinned `axum` version. **Warp** is allowed only at the matrix `warp` version (see `warp_http_rules` in implementation_brief) — generated code often misuses rejections/replies; prefer Actix/Axum unless the spec requires Warp. Do not mix incompatible tower/actix versions; use only one framework per binary unless the design explicitly splits services.
     - **System toolchain:** Generated code assumes `cargo` + `rustc` (Rust 2021) and a normal C toolchain for native deps where required. SQLite is typically via Diesel + libsqlite at link time.
   diesel_sqlite_rules: |
     - **Imports and derives:** In every module that uses Diesel models or queries, start with `use diesel::prelude::*;` (or explicitly `use diesel::{Insertable, Queryable, Selectable, Identifiable, AsChangeset, ...}` as needed). `#[diesel(table_name = ...)]` and `#[diesel(...)]` field attributes ONLY work on structs that derive the matching Diesel traits (`Insertable`, `Queryable`, `Selectable`, etc.). Missing prelude imports cause "cannot find derive macro `Insertable`" / "`diesel` is a crate, not an attribute".
     - **Diesel 2.x error handling — NEVER invent API:** Do NOT use `diesel::result::DatabaseErrorKind::CannotConnect` — that variant does not exist in Diesel 2.3. Match `diesel::result::Error` only: e.g. `Error::DatabaseError(kind, info)` where `kind` is a **documented** variant such as `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`, `CheckViolation`, `SerializationFailure`, `ReadOnlyTransaction`, `UnableToSendCommand`, or use a catch-all `_` arm. For **connection pool** failures when using Diesel's pool, use **`diesel::r2d2::Error`** (same crate path as `Pool` / `ConnectionManager`). Do not use the standalone **`r2d2::Error`** type from a separate `r2d2` dependency together with `diesel::r2d2::Pool` — they are different types (E0308).
     - **Connection pool — Diesel's r2d2 only:** Use `use diesel::r2d2::{ConnectionManager, Pool};` and type aliases like `type DbPool = Pool<ConnectionManager<SqliteConnection>>;`. Do **not** add `[dependencies] r2d2 = "0.8"` for pooling alongside Diesel unless you know you need the standalone crate for something else; prefer **only** `diesel` with features `["sqlite", "r2d2", ...]` so `Pool::builder().build()` returns `Result<_, diesel::r2d2::Error>`.
-    - **diesel_migrations + `embed_migrations!`:** Store migrations in **`migrations/`** next to **`Cargo.toml`** (crate/project root), not under `src/`. Use **`use diesel_migrations::embed_migrations;`** (Rust 2018+ style — do **not** use `#[macro_use] extern crate diesel_migrations;`). Call **`embed_migrations!("migrations")`** with the **string literal path** and **no semicolon** after the macro invocation (it expands to items; a trailing **`;` breaks parsing**). **Never** `embed_migrations!()` with empty parentheses. Path is relative to the **`Cargo.toml` directory**. Do **not** use `embed_migrations!("../migrations")` unless migrations truly live outside the crate (avoid in generated projects). Each migration is a subfolder `migrations/YYYY-MM-DD-HHMMSS_name/` containing **`up.sql`** (required) and optionally `down.sql`. If you reference `embed_migrations!`, you **must** emit those folders and SQL files in the same generation pass or the proc macro panics ("Failed to receive migrations dir").
-    - **`run_pending_migrations` (Diesel 2.x):** Returns `Result<Vec<MigrationVersion<'_>>, diesel::result::Error>`, not `Result<(), _>`. If the function must return `Result<(), E>`, use e.g. `conn.run_pending_migrations(MIGRATIONS).map(|_| ())?` or an equivalent map. Do not return the `Vec` result where `()` is expected (E0308).
+    - **Migrations (preferred — no `embed_migrations!`):** Do **not** use the **`embed_migrations!`** proc macro or **`diesel_migrations::embed_migrations`**. Instead, store SQL under **`migrations/`** next to **`Cargo.toml`** (not under `src/`): each step is a subfolder `migrations/YYYY-MM-DD-HHMMSS_name/` with **`up.sql`**. At startup, resolve the directory with **`Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations")`**, read subdirectories in **sorted** order, read each **`up.sql`**, and apply with **`diesel::connection::SimpleConnection::batch_execute`** on **`SqliteConnection`** (e.g. `conn.batch_execute(&sql)?`). This needs only the **`diesel`** crate (no **`diesel_migrations`** dependency for embedding). For idempotency in production, track applied versions in a small table or run each `up.sql` only once per environment; for generated demos, document that order is fixed.
+    - **Legacy (avoid in new code):** If you ever used **`embed_migrations!`**, it requires **`diesel_migrations`** and correct **`run_pending_migrations(MIGRATIONS)`** typing — prefer deleting that path and switching to the file-based **`batch_execute`** pattern above.
     - **SQLite vs PostgreSQL query patterns:** Default stack is **Diesel + SQLite** (see Cargo features). Do NOT write Postgres-only patterns unless `DATABASE_URL` is documented as Postgres and `diesel` uses the `postgres` feature instead of `sqlite`.
     - **INSERT + RETURNING + `get_result` on SQLite:** Without the `returning_clauses_for_sqlite_3_35` feature, Diesel rejects `.returning(...).get_result(&mut conn)` for SQLite (`DoesNotSupportReturningClause`, E0277 on `ReturningClause`). **Preferred portable pattern:** `diesel::insert_into(table).values(&new_row).execute(&mut conn)?;` then load the row with a separate `select` by primary key, or use `diesel::RunQueryDsl::execute` + query by id. **If you use `.returning(...).get_result()`**, Cargo.toml MUST enable `returning_clauses_for_sqlite_3_35` on `diesel` (already in the matrix) and the returning columns must match the target struct exactly (`Selectable` / field order and types).
     - **Queryable / Selectable / Insertable alignment:** The columns in `.select(...)`, `.returning(...)`, and `table::all_columns` must match the struct you load into (same count, order, and types). Use `#[derive(Queryable, Selectable, ...)]` with `#[diesel(table_name = ...)]` and prefer `.select(Model::as_select())` or explicit column lists that mirror the struct. Mismatches produce E0277 `CompatibleType` / `SelectBy` errors.
@@ -37,14 +37,20 @@ rust-tauri:
     actix-files: "0.6"
     # Alternative to Actix for pure HTTP APIs (use one of actix-web or axum per project)
     axum: "0.7"
+    # Only if the design uses Warp; follow warp_http_rules in implementation_brief (Reject / replies / Rejection API)
+    warp: "0.3"
     serde: { version: "1", features: ["derive"] }
     serde_json: "1"
     tempfile: "3"
     tokio: { version: "1", features: ["full"] }
+    # Common for CLIs and small binaries; declare if code uses `use anyhow` or clap derives
+    anyhow: "1"
+    clap: { version: "4", features: ["derive"] }
     # Diesel 2.x + SQLite: r2d2 pool; returning_clauses_for_sqlite_3_35 allows .returning().get_result()
     # when SQLite >= 3.35. If you avoid RETURNING entirely, builds still work on older SQLite.
     diesel: { version: "2", features: ["sqlite", "r2d2", "returning_clauses_for_sqlite_3_35"] }
-    diesel_migrations: "2"
+    # Optional: only if you use Diesel CLI metadata or non-embed helpers; file-based migrations use diesel alone.
+    # diesel_migrations: "2"
     # Password hashing (Actix/Axum APIs with Auth): use matrix versions; enable getrandom for OsRng
     argon2: "0.5"
     rand_core: { version: "0.6", features: ["getrandom"] }
@@ -55,6 +61,13 @@ rust-tauri:
     - **`PasswordHasher::hash_password`** takes **`(password_bytes, salt)`** where **salt** is `impl Into<Salt>` — e.g. **`let salt = SaltString::generate(&mut OsRng);`** then **`.hash_password(password.as_bytes(), &salt)`** (pass **`&salt`** or **`salt.as_salt()`** per docs), **not** `&mut OsRng` as the second argument.
     - **`password_hash::Error`** does not always compose with **`anyhow::Result`** via `?`. Use **`.map_err(|e| anyhow::anyhow!("{e:?}"))?`** or **`return Err(anyhow::anyhow!(...).into());`** instead of bare `?` into `anyhow::Error` unless you use a compatible error type.
     - Do **not** wrap **`anyhow::Error`** in **`Box<dyn std::error::Error + ...>`** for Diesel; map to **`diesel::result::Error`** or use **`String`** / a custom error that implements **`std::error::Error`**.
+  warp_http_rules: |
+    - **When using Warp (pinned `warp` 0.3.x):** Prefer **Actix** or **Axum** for new servers unless the design explicitly requires Warp. If you use Warp:
+    - **`warp::reject::custom(e)`** requires **`e: T` where `T: warp::reject::Reject`**. On your custom error type (usually `#[derive(Debug)]`), add **`impl warp::reject::Reject for MyError {}`** (empty impl). The type must be **`Send` + `Sync`**.
+    - Do **not** **`#[derive(Clone)]`** on error enums that store **`std::io::Error`** — **`io::Error` does not implement `Clone`**. Use **`Io(String)`** (map with **`.to_string()`**) or another **`Clone`**-friendly representation.
+    - **`warp::reject::Rejection`** in 0.3 has **no** **`.is_internal()`** (that is not Warp’s API). Extract custom errors with **`err.find::<MyError>()`** / pattern match on **`find`**, not methods copied from other frameworks.
+    - **`warp::reply::with_status(reply, status)`:** The first argument must implement **`Reply`**. Use an **owned** **`String`** for text bodies, e.g. **`let body = msg; Ok(warp::reply::with_status(body, status))`**. Do **not** pass **`&e.to_string()`** (temporary **`String`** dropped while borrowed — E0716 / `'static` issues). **`&'static str`** literals are fine.
+    - If you **`use anyhow::...`** or **`clap::`** / **`#[derive(Parser)]`**, add **`anyhow`** and **`clap`** to **`Cargo.toml`** (compatible semver with the matrix / ecosystem); do not `use` crates you did not declare.
 
 node-react:
   package_json_rules: |

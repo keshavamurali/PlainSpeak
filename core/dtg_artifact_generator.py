@@ -28,7 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class LocalBuildFailedError(RuntimeError):
-    """Raised when local `cargo`/`npm` build fails after per-DTG-node retries (stops the pipeline for debugging)."""
+    """Raised when local `cargo`/`npm` build fails after per-DTG-node retries and `ABORT_ON_LOCAL_BUILD_FAILURE=1`."""
 
     def __init__(
         self,
@@ -54,8 +54,13 @@ def _per_node_build_max_retries() -> int:
 
 
 def _abort_on_local_build_failure() -> bool:
-    """When True (default), failed local build after node retries raises LocalBuildFailedError."""
-    return os.environ.get("ABORT_ON_LOCAL_BUILD_FAILURE", "1").strip().lower() not in ("0", "false", "no")
+    """
+    When True, failed local build after node retries raises LocalBuildFailedError (stops the pipeline).
+    Default False: log failure and continue with remaining DTG nodes (same as legacy behavior).
+    Set ABORT_ON_LOCAL_BUILD_FAILURE=1 (or true/yes) to abort.
+    """
+    v = os.environ.get("ABORT_ON_LOCAL_BUILD_FAILURE", "0").strip().lower()
+    return v in ("1", "true", "yes")
 
 
 # Configurable context truncation (env: DESIGN_CONTEXT_MAX_CHARS, CODE_CONTEXT_MAX_CHARS). Reduces input tokens.
@@ -306,6 +311,10 @@ def _dependency_rules_text(framework: str, matrix: dict) -> str:
         if isinstance(ap, str) and ap.strip():
             lines.append("### Argon2 / password-hash (required when using argon2 or password hashing)")
             lines.append(ap.strip())
+        wh = section.get("warp_http_rules")
+        if isinstance(wh, str) and wh.strip():
+            lines.append("### Warp HTTP (required when using the `warp` crate)")
+            lines.append(wh.strip())
     deps = section.get("dependencies")
     if deps and isinstance(deps, dict):
         lines.append("Use these dependency versions (or compatible); do not invent versions or features:")
@@ -666,17 +675,21 @@ def _parse_build_failure_hints(stderr: str, framework: str) -> str:
             )
         if "failed to receive migrations" in err or "embed_migrations!" in err:
             hints.append(
-                "Diesel migrations: create `migrations/` next to Cargo.toml with dated subfolders and up.sql; use embed_migrations!(\"migrations\") not ../migrations. Emit migration files whenever you emit embed_migrations! or MIGRATIONS will be missing."
+                "Diesel migrations (preferred): remove `embed_migrations!` / `diesel_migrations` embed usage; add `migrations/` next to Cargo.toml with dated subfolders and `up.sql`, then apply each file with `diesel::connection::SimpleConnection::batch_execute` on `SqliteConnection` (see diesel_sqlite_rules). Legacy: if keeping embed, emit `migrations/` and fix macro syntax per implementation_brief."
+            )
+        if "macros that expand to items must" in err and "embed_migrations" in err:
+            hints.append(
+                "Prefer replacing `embed_migrations!` with file-based `batch_execute` migrations (diesel_sqlite_rules). If you must keep embed: end with **`embed_migrations!(\"migrations\");`** in submodules; do not use `embed_migrations!{\"migrations\"}`."
             )
         if ("embed_migrations" in err and "expected one of `!` or `::`" in err) or (
             "embed_migrations!();" in err.replace(" ", "")
         ):
             hints.append(
-                "Diesel: use `use diesel_migrations::embed_migrations;` (not `extern crate`). Call `embed_migrations!(\"migrations\")` with **no semicolon** after the macro (it expands to items). Never `embed_migrations!()` with empty parentheses. See diesel_sqlite_rules in implementation_brief."
+                "Prefer removing `embed_migrations!` and using `batch_execute` + on-disk `migrations/*/up.sql` (diesel_sqlite_rules). Legacy fix: `use diesel_migrations::embed_migrations;` and `embed_migrations!(\"migrations\");` — never empty `embed_migrations!()`."
             )
         if "not found in this scope" in err and "migrations" in err:
             hints.append(
-                "embed_migrations! failed or is missing — fix migrations directory path and ensure the macro succeeds so `MIGRATIONS` exists."
+                "If you removed embed: implement a small runner that reads `migrations/*/up.sql` and `batch_execute`s each. If you still use embed: ensure `diesel_migrations` is in Cargo.toml and `migrations/` exists so the macro expands."
             )
         if "osrng" in err.replace("_", "") and ("argon2" in err or "password_hash" in err or "password-hash" in err):
             hints.append(
@@ -708,6 +721,34 @@ def _parse_build_failure_hints(stderr: str, framework: str) -> str:
         if "httpservicefactory" in err.replace("_", "").replace(" ", "").lower():
             hints.append(
                 "Actix-web 4: use web::get().to(handler) with handler return types that implement Responder; check extractors and HttpResponse match the matrix actix-web version."
+            )
+        if "warp::reject::reject" in err and "not satisfied" in err:
+            hints.append(
+                "Warp: `warp::reject::custom(e)` needs `impl warp::reject::Reject for YourError {}` (empty impl) after `#[derive(Debug)]`. Do not store `std::io::Error` in a `Clone` derive — use `String` or map I/O to text. See warp_http_rules in implementation_brief."
+            )
+        if "is_internal" in err and "rejection" in err and "warp" in err:
+            hints.append(
+                "Warp Rejection: there is no `.is_internal()` on `warp::reject::Rejection` (0.3). Use `err.find::<YourError>()` to recover custom errors. See warp_http_rules."
+            )
+        if "temporary value dropped while borrowed" in err and ("with_status" in err or "warp" in err):
+            hints.append(
+                "Warp reply: use an owned `String` for `warp::reply::with_status(body, status)` (bind `let body = msg;` first). Do not pass `&e.to_string()` — it does not live long enough. See warp_http_rules."
+            )
+        if "io::error" in err and "clone" in err and "not satisfied" in err:
+            hints.append(
+                "Do not `#[derive(Clone)]` on enums/structs holding `std::io::Error`; use `String` (e.g. Io(String)) or omit Clone. See warp_http_rules."
+            )
+        if "unresolved import `anyhow`" in err or ("e0432" in err and "anyhow" in err):
+            hints.append(
+                "Add `anyhow = \"1\"` (or matrix version) to Cargo.toml if you `use anyhow::...`. See dependency list in implementation_brief."
+            )
+        if "unresolved import `clap`" in err or ("cannot find attribute `command`" in err and "clap" in err):
+            hints.append(
+                "Add `clap` with `features = [\"derive\"]` to Cargo.toml if you use `#[derive(Parser)]` / clap attributes. See dependency list in implementation_brief."
+            )
+        if "is not a future" in err and "result" in err:
+            hints.append(
+                "Async: only `.await` things that are `Future` (e.g. async fn calls). `Result` is not a Future — use `?` or `match`, not `.await` on plain `Result`."
             )
         if "--- cargo clippy ---" in err or ("clippy" in err and "error" in err):
             hints.append(
@@ -802,11 +843,39 @@ def _format_cargo_diesel_dep(diesel_spec: Any) -> str | None:
     return None
 
 
+def _fix_embed_migrations_line(line: str) -> str:
+    """
+    Normalize a single line containing embed_migrations!.
+    - Submodules (e.g. src/db/connection.rs): rustc requires a trailing semicolon between items
+      ("macros that expand to items must be ... followed by a semicolon").
+    - Crate roots: `embed_migrations!("migrations");` is also valid — do not strip semicolons.
+    - Fix bad rustc suggestions: `embed_migrations!{"migrations"}` -> `embed_migrations!("migrations");`
+    """
+    if "embed_migrations!" not in line:
+        return line
+    ending = "\n" if line.endswith("\n") else ""
+    s = line[:-1] if line.endswith("\n") else line
+
+    if re.search(r"embed_migrations!\s*\{", s):
+        s = re.sub(r'embed_migrations!\s*\{\s*"([^"]+)"\s*\}\s*;?', r'embed_migrations!("\1");', s)
+
+    m = re.search(r'embed_migrations!\(\s*"([^"]+)"\s*\)', s)
+    if not m:
+        return s + ending
+    pos_after_paren = m.end()
+    tail = s[pos_after_paren:].lstrip()
+    if tail.startswith(";"):
+        return s + ending
+    s = s[:pos_after_paren] + ";" + s[pos_after_paren:]
+    return s + ending
+
+
 def _normalize_rust_embed_migrations(hlig_dir: Path) -> None:
     """
-    Fix common LLM mistakes around Diesel embed_migrations!:
+    Fix common LLM mistakes around Diesel embed_migrations! (legacy — preferred pattern is
+    file-based migrations + SimpleConnection::batch_execute, no diesel_migrations embed):
     - Replace legacy #[macro_use] extern crate diesel_migrations; with use diesel_migrations::embed_migrations;
-    - Remove trailing semicolon after embed_migrations!("...") — the macro expands to items; ';' breaks parsing.
+    - Ensure embed_migrations!("..."); has a trailing semicolon in submodule-friendly form.
     """
     src = hlig_dir / "src"
     if not src.is_dir():
@@ -830,11 +899,8 @@ def _normalize_rust_embed_migrations(hlig_dir: Path) -> None:
             "use diesel_migrations::embed_migrations;",
             text,
         )
-        text = re.sub(
-            r'embed_migrations!\(\s*"([^"]+)"\s*\)\s*;',
-            r'embed_migrations!("\1")',
-            text,
-        )
+        lines = text.splitlines(keepends=True)
+        text = "".join(_fix_embed_migrations_line(line) if "embed_migrations!" in line else line for line in lines)
         if text != orig:
             try:
                 fp.write_text(text, encoding="utf-8")
@@ -1537,7 +1603,7 @@ path = "src/main.rs"
     ) -> None:
         """
         Generate one code-type DTG node, run local build; on failure retry LLM for this node only.
-        After max retries, raises LocalBuildFailedError if ABORT_ON_LOCAL_BUILD_FAILURE (default).
+        After max retries, raises LocalBuildFailedError only if ABORT_ON_LOCAL_BUILD_FAILURE=1; otherwise continues.
         """
         nid = node.get("id", "")
         deps = node.get("dependencies") or []
@@ -1624,8 +1690,12 @@ path = "src/main.rs"
             )
         log_pipeline_event(
             session_id,
-            "local_build_skipped_continue",
-            {"hlig": hlig_id, "dtg_node": nid, "reason": "ABORT_ON_LOCAL_BUILD_FAILURE=0"},
+            "local_build_failed_continue",
+            {
+                "hlig": hlig_id,
+                "dtg_node": nid,
+                "reason": "local build failed after retries; continuing (set ABORT_ON_LOCAL_BUILD_FAILURE=1 to stop)",
+            },
         )
         for p in files:
             if p not in generated_code_paths:
