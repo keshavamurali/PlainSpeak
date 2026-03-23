@@ -58,14 +58,13 @@ Parse the JSON and follow `implementation_instructions` from design_spec when pr
 
 ### rust-tauri (Rust + Tauri)
 - Use Rust 2021 edition
-- Tauri v2 for desktop apps. For backend APIs without a desktop shell, prefer plain Rust (actix-web, axum) instead of Tauri.
+- Tauri v2 for desktop apps. For backend APIs without a desktop shell, prefer plain Rust (**actix-web** or **axum** from the matrix) instead of Tauri. Use **Warp** only if required; follow **`warp_http_rules`** in `implementation_brief` (see below).
 - Cargo.toml with dependencies pinned by the dependency matrix from the implementation_brief
 - **Diesel + SQLite (read the full `diesel_sqlite_rules` block in implementation_brief — mandatory when using Diesel):**
   - Use `use diesel::prelude::*;` in every module with models/queries so `Insertable`, `Queryable`, `#[diesel(...)]`, etc. resolve.
   - **Never** use `diesel::result::DatabaseErrorKind::CannotConnect` — it does not exist in Diesel 2.x. Match only real `Error` / `DatabaseErrorKind` variants from Diesel 2.3 docs.
   - **Pool:** Use **`diesel::r2d2`** only (`ConnectionManager`, `Pool`, `diesel::r2d2::Error`). Do not mix a standalone **`r2d2`** crate dependency for the same pool — error types differ and `cargo` fails with E0308.
-  - **Migrations:** If you use `embed_migrations!`, create a **`migrations/`** directory beside `Cargo.toml` with Diesel-style dated subfolders and **`up.sql`** files. Use **`use diesel_migrations::embed_migrations;`** at the top of the crate root (do **not** use `#[macro_use] extern crate diesel_migrations;`). Invoke **`embed_migrations!("migrations")`** on its **own line with no trailing semicolon** — the macro expands to **items** (a module); a **`;` after it causes a compile error** (`expected one of \`!\` or \`::\``). The path string is **required**; **`embed_migrations!()`** with no argument is invalid. Do not use `../migrations` unless that is really where files live. Ship migration SQL in the same output as `db/mod.rs`.
-  - **`run_pending_migrations`:** Map the returned `Vec<MigrationVersion>` to `()` if your API returns `Result<(), _>` (e.g. `.map(|_| ())?`).
+  - **Migrations (preferred):** Do **not** use **`embed_migrations!`** or the **`diesel_migrations`** embed macro. Put SQL under **`migrations/`** beside **`Cargo.toml`** (Diesel-style dated subfolders, each with **`up.sql`**). At startup, list that directory in sorted order, read each **`up.sql`**, and apply with **`diesel::connection::SimpleConnection::batch_execute`** on **`SqliteConnection`** (needs only **`diesel`**, not **`diesel_migrations`**). Use **`Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations")`** to locate files. Ship migration SQL in the same generation pass as `db`/connection setup. See **`diesel_sqlite_rules`** in `implementation_brief` for the full pattern.
   - Default DB is SQLite via matrix `diesel` features (`sqlite`, `r2d2`, `returning_clauses_for_sqlite_3_35`). Do not assume PostgreSQL semantics unless the project explicitly uses the `postgres` feature and docs say so.
   - Prefer **insert + separate select by id** for portability, or ensure `.returning(...).get_result()` matches the struct exactly and Cargo.toml includes the matrix `diesel` features (RETURNING on SQLite requires that feature and SQLite ≥ 3.35).
   - Keep `schema.rs` `table!` types and model derives in strict alignment (avoids E0277 `CompatibleType` / `SelectBy` errors).
@@ -73,6 +72,11 @@ Parse the JSON and follow `implementation_instructions` from design_spec when pr
   - In **Cargo.toml**, add **`rand_core = { version = "0.6", features = ["getrandom"] }`** (and **`argon2`** at the matrix version) so **`OsRng`** is available. Prefer **`use rand_core::OsRng;`** at the crate root, or **`use rand::rngs::OsRng;`** with **`rand`** from the matrix. Avoid fragile imports like **`password_hash::rand_core::OsRng`** unless you verify they compile.
   - **`PasswordHasher::hash_password`** takes **`(password_as_bytes, salt)`**. Generate salt with **`let salt = SaltString::generate(&mut OsRng);`** then call **`.hash_password(password.as_bytes(), &salt)?`** — never pass **`&mut OsRng`** as the second argument.
   - For **`Result<_, anyhow::Error>`**, map password-hash errors: **`.map_err(|e| anyhow::anyhow!("{e:?}"))?`** because **`password_hash::Error`** may not implement **`std::error::Error`** in a way **`?` accepts. Do not use **`Box::new(anyhow!(...))`** as a **`dyn StdError`** for Diesel.
+- **Warp (only if the stack uses `warp` — read `warp_http_rules` in implementation_brief):**
+  - Add **`impl warp::reject::Reject for YourError {}`** for any type passed to **`warp::reject::custom(...)`** (after **`#[derive(Debug)]`**).
+  - Do **not** **`#[derive(Clone)]`** on error types that embed **`std::io::Error`**; use **`String`** (e.g. **`Io(String)`**) for I/O failures.
+  - Do **not** use **`Rejection::is_internal()`** — use **`err.find::<YourError>()`**. Do **not** pass **`&e.to_string()`** to **`with_status`**; bind an **owned** **`String`** first so the reply body is not a temporary borrow.
+  - If you **`use anyhow::`** or **`clap::`** / **`#[derive(Parser)]`**, list **`anyhow`** and **`clap`** in **`Cargo.toml`** (matrix-pinned versions in `implementation_brief`).
 - Structure: `src/main.rs`, `src/lib.rs` as needed
 - Include build instructions: `cargo build`, `cargo run`
 - **Modules:** Do not create both `src/X.rs` and `src/X/mod.rs` for the same module; use one.
@@ -116,6 +120,7 @@ Your output **must** compile and build without errors. The system will run `carg
 - When **`compile_errors`** is present in the input: a previous build failed. Read the stdout/stderr and **Hints to fix** in `compile_errors`. When **`previous_attempt_files`** is also present, treat it as the **authoritative current source** for those paths (full text, not previews)—fix errors there and return updated full contents in the `files` array. Fix dependency versions/features to match the implementation_brief; ensure Cargo.toml has [[bin]] or [lib] and the corresponding src file exists. Output every file that must change (often all files you touch plus any manifest edits). Do not introduce new errors.
 - **Actix-web:** Register handlers with compatible types (e.g. `web::get().to(handler)` with correct `HttpResponse` / extractors). If you see `HttpServiceFactory` trait errors, align handler signatures with Actix 4 docs for the version in the dependency matrix.
 - **Axum:** If you choose Axum instead of Actix, use the **axum** version from the dependency matrix in `implementation_brief` and keep handler types compatible with that major version.
+- **Warp:** Prefer Actix/Axum unless the brief requires Warp. If you use **Warp**, follow **`warp_http_rules`** in `implementation_brief` ( **`Reject` impl**, no **`is_internal()`**, owned **`String`** bodies for **`with_status`**, **`anyhow`/`clap`** declared in **`Cargo.toml`**).
 - **Node HTTP (Express/Fastify):** If you add a Node server, pin **express** or **fastify** to the versions listed in the matrix; add **typescript** to devDependencies when using `.ts`/`.tsx`.
 
 ### Simplicity (prefer smaller, clearer code)
@@ -130,10 +135,11 @@ Your output **must** compile and build without errors. The system will run `carg
 **Rust (`rust-tauri` / backend):**
 - [ ] `Cargo.toml` has `[[bin]]` → `src/main.rs` and/or `[lib]` → `src/lib.rs`, and those files exist.
 - [ ] Every dependency appears in `Cargo.toml` with versions/features aligned to the matrix (no orphan `use` of crates you did not declare).
-- [ ] If using `embed_migrations!`: `migrations/` exists next to `Cargo.toml`; **`use diesel_migrations::embed_migrations;`**; macro line is **`embed_migrations!("migrations")` without a semicolon** (never empty `embed_migrations!()`), and each step has `up.sql`.
+- [ ] If the app uses DB migrations: `migrations/` exists next to `Cargo.toml` with dated subfolders and **`up.sql`** files; migrations are applied via **`batch_execute`** (or equivalent) per **`diesel_sqlite_rules`**, not **`embed_migrations!`**.
 - [ ] If using Argon2: `rand_core` has **`getrandom`** feature (or `rand` + `OsRng`); salt via **`SaltString::generate`**, not `OsRng` as `hash_password`’s second arg; password errors mapped for `anyhow`.
 - [ ] If using Diesel pool: imports are `diesel::r2d2` only (no mixed standalone `r2d2` error types).
 - [ ] If using Tauri: `tauri.conf.json` includes required fields (e.g. `identifier`) and uses only allowed features from the matrix.
+- [ ] If using **Warp**: custom errors used with **`reject::custom`** implement **`warp::reject::Reject`**; **`Cargo.toml`** includes **`warp`**, **`anyhow`**, **`clap`** if referenced; no **`is_internal()`** on **`Rejection`**; **`with_status`** uses owned reply bodies (see **`warp_http_rules`**).
 
 **Node / React (`node-react`):**
 - [ ] `package.json` has `build` (prefer `"vite build"`), `index.html` at project root, and script `src` matches a real `.jsx`/`.tsx` entry.

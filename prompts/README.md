@@ -16,6 +16,7 @@ Reference these in `agents/config/agents.yaml` via the `prompt_file` config key.
 | `ENABLE_LOCAL_ESLINT` | `1` | Run `npm exec -- eslint .` when `eslint` is in `package.json` **and** a config exists (`eslint.config.*` or `.eslintrc.*` / `eslintConfig`). |
 | `ESLINT_MAX_WARNINGS_ZERO` | `0` | If `1`, pass `--max-warnings 0` to eslint. |
 | `PER_NODE_BUILD_RETRIES` | `2` | Extra codegen attempts after a failed local build (default **3** tries total per DTG code node). |
+| `ABORT_ON_LOCAL_BUILD_FAILURE` | `0` | If `1`, stop the HLIG pipeline when local `cargo`/`npm` build still fails after retries (`LocalBuildFailedError`). Default **continue** with remaining nodes. |
 | `BUILD_RETRY_FILES_MAX_TOTAL_CHARS` | `100000` | Max combined size of `previous_attempt_files` sent to the LLM on retry (full sources + manifests). Use `0` for no limit. |
 
 Pinned crate/npm versions and layout rules for the coder live in `agents/config/dependency_matrix.yaml` and are injected into the **implementation brief** at codegen time.

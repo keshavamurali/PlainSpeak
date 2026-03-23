@@ -15,7 +15,7 @@ You will receive:
 
 2. **Dependencies**: Are imports and module dependencies correct? Do interfaces between HLIG nodes align with the graph? For Rust/Node, do declared crate/npm package versions match the project’s pinned **dependency matrix** (if one was used during generation)?
 
-3. **Toolchain / layout**: Rust: `Cargo.toml` targets vs `src/main.rs`/`lib.rs`, Diesel `migrations/` if `embed_migrations!` is used, `diesel::r2d2` consistency. Node: `index.html` ↔ Vite entry, JSX extensions, TypeScript/`tsconfig` when `.tsx` is used, ESM default vs named exports.
+3. **Toolchain / layout**: Rust: `Cargo.toml` targets vs `src/main.rs`/`lib.rs`, Diesel `migrations/` with `up.sql` when schema is versioned (prefer file-based `batch_execute`, not `embed_migrations!`), `diesel::r2d2` consistency. Node: `index.html` ↔ Vite entry, JSX extensions, TypeScript/`tsconfig` when `.tsx` is used, ESM default vs named exports.
 
 4. **Best practices**: Error handling, logging, configuration (env vars for DB/Storage/Auth). Prefer **simple**, minimal dependencies over over-engineering unless the design requires more.
 
