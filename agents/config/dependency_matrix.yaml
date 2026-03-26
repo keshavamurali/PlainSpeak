@@ -73,6 +73,7 @@ node-react:
   package_json_rules: |
     - package.json MUST include a "build" script. Prefer "vite build" only (do not run "tsc" in the build script so type errors in tests do not block the app build).
     - React + Vite: any file containing JSX MUST use extension .jsx or .tsx (never .js for JSX). Entry should be src/main.jsx or src/main.tsx; index.html script src must match.
+    - Vite config + ESM package: When package.json has "type": "module", vite.config.js MUST be ESM (import + export default defineConfig). Do NOT use module.exports in vite.config.js. Use vite.config.cjs with module.exports if CommonJS is required.
     - Use Vitest (vi) for tests only; do not use Jest (jest). Import vi from "vitest" for mocks.
     - Export from api/client (or your API module) every function that hooks and components import (e.g. fetchAboutContent, fetchMenuPdf).
     - tsconfig.json: valid JSON only; do not add "types" for packages not in package.json (e.g. testing-library__jest-dom). Use "vite/client" for import.meta.env. Exclude **/__tests__/** and **/*.test.* from compilation if you run tsc.

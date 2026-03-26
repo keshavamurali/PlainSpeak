@@ -17,6 +17,7 @@ except ImportError:
     log_pipeline_event = lambda *a, **kw: None
     CostLimitExceeded = Exception  # noqa: type to satisfy isinstance
 from agents.runner import AgentRunner
+from core.expansion_engine import EXPANSION_STRATEGIES, default_expansion_strategy_for_node
 from context.execution_context import ExecutionContext
 from session.manager import SessionManager
 from core.event_bus import event_bus
@@ -268,6 +269,12 @@ def _enrich_hlig_graph(hlig_graph: dict) -> dict:
             if isinstance(n, dict) and "parent_hlig" not in n:
                 n["parent_hlig"] = parent_hlig
                 n["language"] = lang
+            if isinstance(n, dict):
+                tt = (n.get("task_type") or "").lower()
+                if tt in ("code", "integration", "test", "build", "verification"):
+                    es = (n.get("expansion_strategy") or "").strip()
+                    if not es or es not in EXPANSION_STRATEGIES:
+                        n["expansion_strategy"] = default_expansion_strategy_for_node(parent_hlig, n)
     return hlig_graph
 
 

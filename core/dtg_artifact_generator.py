@@ -14,7 +14,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from core.codegen_context import (
+    build_snapshots_payload,
+    extract_public_surface,
+    load_shared_interfaces_excerpt,
+)
+from core.expansion_engine import expand_dtg_node, is_code_execution_node, is_design_like_node
 from core.hlig_dtg_graphs import HLIGGraph, DTGGraph
+from core.mechanical_code_validator import (
+    extra_toolchain_validate,
+    run_incremental_cargo_check,
+    validate_generated_content,
+    validate_rust_workspace_coherence,
+)
 
 try:
     from core.debug_logger import log_pipeline_event, CostLimitExceeded, check_cost_limit_before_llm, log_llm_input
@@ -26,9 +38,11 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+IG_EXECUTION_LOG = "ig_execution_log.jsonl"
+
 
 class LocalBuildFailedError(RuntimeError):
-    """Raised when local `cargo`/`npm` build fails after per-DTG-node retries and `ABORT_ON_LOCAL_BUILD_FAILURE=1`."""
+    """Raised when local `cargo`/`npm` build fails after per-DTG-node retries (default: abort the pipeline)."""
 
     def __init__(
         self,
@@ -53,14 +67,68 @@ def _per_node_build_max_retries() -> int:
         return 2
 
 
+def _ig_code_step_max_iterations() -> int:
+    """Max generate→review→mechanical iterations per IG file (and legacy mechanical retries scale)."""
+    raw = os.environ.get("IG_CODE_STEP_MAX_ITERATIONS", "6").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 6
+
+
+def _ig_two_phase_enabled() -> bool:
+    return _env_truthy("IG_TWO_PHASE_CODEGEN", "0")
+
+
+def _ig_two_phase_eligible(fp: str) -> bool:
+    pl = fp.lower().replace("\\", "/")
+    return pl.endswith((".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"))
+
+
+def _shared_interfaces_max_chars() -> int:
+    return _ctx_limit("SHARED_INTERFACES_MAX_CHARS", 14_000)
+
+
+def _truncate_same_node_prior(content: str) -> str:
+    """Larger default than CODE_CONTEXT for cross-file consistency within one DTG node."""
+    lim = _ctx_limit("SAME_NODE_PRIOR_MAX_CHARS", 8000)
+    if lim <= 0:
+        return content
+    if len(content) <= lim:
+        return content
+    return content[:lim] + "\n/* ... truncated (SAME_NODE_PRIOR_MAX_CHARS) ... */\n"
+
+
+def _append_ig_execution_log(hlig_dir: Path, record: dict) -> None:
+    fp = hlig_dir / IG_EXECUTION_LOG
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        with fp.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except OSError:
+        pass
+
+
+def _parse_code_reviewer_status(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return "pass"
+    try:
+        from core.json_parser import parse_llm_json
+        parsed = parse_llm_json(text, required_keys=["overall_status"])
+        return str(parsed.get("overall_status", "pass")).lower()
+    except Exception:
+        return "pass"
+
+
 def _abort_on_local_build_failure() -> bool:
     """
     When True, failed local build after node retries raises LocalBuildFailedError (stops the pipeline).
-    Default False: log failure and continue with remaining DTG nodes (same as legacy behavior).
-    Set ABORT_ON_LOCAL_BUILD_FAILURE=1 (or true/yes) to abort.
+    Default True: stop the run on any build failure after retries.
+    Set ABORT_ON_LOCAL_BUILD_FAILURE=0 (or false/no) to log and continue with remaining DTG nodes.
     """
-    v = os.environ.get("ABORT_ON_LOCAL_BUILD_FAILURE", "0").strip().lower()
-    return v in ("1", "true", "yes")
+    v = os.environ.get("ABORT_ON_LOCAL_BUILD_FAILURE", "1").strip().lower()
+    return v not in ("0", "false", "no")
 
 
 # Configurable context truncation (env: DESIGN_CONTEXT_MAX_CHARS, CODE_CONTEXT_MAX_CHARS). Reduces input tokens.
@@ -188,7 +256,7 @@ def _build_dep_ctx(deps: list[str], resolved: dict[str, str], nodes_by_id: dict[
             result[dep] = content
             continue
         node = nodes_by_id.get(dep)
-        if node and (node.get("task_type") or "").lower() in ("design", "documentation"):
+        if node and is_design_like_node(node):
             result[dep] = _make_dtg_node_ref(node)
     return result
 
@@ -325,24 +393,153 @@ def _dependency_rules_text(framework: str, matrix: dict) -> str:
 def _infer_framework(hlig_node: dict) -> str:
     """
     Infer framework from HLIG node.
-    - node-react: frontend, UI, web pages, website
-    - rust-tauri: backend, API, server, desktop
+    - node-react: web/JS stack when Rust is not declared, or SPA HLIGs mis-tagged Rust+web without Tauri.
+    - rust-tauri: Tauri/desktop, Rust-only services, or backend/API HLIGs implemented in Rust.
     """
     task = (hlig_node.get("task") or "").lower()
-    interfaces = [str(x).lower() for x in hlig_node.get("external_interfaces", [])]
-    lang = (hlig_node.get("language") or "Rust, Tauri, React, CSS").lower()
+    interfaces = {str(x).lower() for x in (hlig_node.get("external_interfaces") or [])}
+    lang = (hlig_node.get("language") or "").lower()
 
-    if "desktop" in task or "tauri" in lang or "rust" in lang:
+    def _lang_has_rust(s: str) -> bool:
+        return bool(re.search(r"\brush\b", s))
+
+    def _lang_has_tauri(s: str) -> bool:
+        return "tauri" in s
+
+    web_markers = (
+        "react",
+        "javascript",
+        "typescript",
+        "html",
+        "css",
+        "vue",
+        "svelte",
+        "vite",
+    )
+    has_rust = _lang_has_rust(lang)
+    has_tauri = _lang_has_tauri(lang)
+    has_web = any(m in lang for m in web_markers)
+
+    # Desktop / Tauri targets always need a Rust crate root.
+    if "desktop" in task or has_tauri:
         return "rust-tauri"
-    if "frontend" in task or "ui" in task or "web page" in task or "react" in task:
+
+    # Historical default when language omitted: assume Rust-capable HLIG.
+    if not lang.strip():
+        return "rust-tauri"
+
+    # No Rust in declared stack — never scaffold Cargo (e.g. Vite/React-only HLIGs).
+    if not has_rust:
         return "node-react"
-    if "website" in task and "serve" not in task:
+
+    frontendish = any(
+        k in task
+        for k in (
+            "frontend",
+            "user interface",
+            "web page",
+            "web pages",
+            "website",
+            "landing page",
+            "visitor",
+            "display",
+            "spa",
+        )
+    ) or "react" in task
+
+    backendish = any(
+        k in task
+        for k in (
+            "backend",
+            "microservice",
+            " axum",
+            " actix",
+            "diesel",
+            "sqlx",
+            "rest api",
+            "graphql server",
+            "web server",
+            "http server",
+            "file server",
+            "api server",
+            "server directory",
+            "server directories",
+            "reading files",
+            "read files from",
+            "filesystem",
+            "database",
+        )
+    )
+    if "api" in task and not frontendish:
+        backendish = True
+    if (("server" in task) or ("serve" in task)) and frontendish:
+        # e.g. "Serve and display the … website" — UI HLIG, not a Rust service.
+        pass
+    elif "server" in task and not frontendish:
+        backendish = True
+
+    # Rust-only compilation unit.
+    if not has_web:
+        return "rust-tauri"
+
+    # Rust + web without Tauri: full-stack mistake vs SPA — prefer Node when task reads like UI.
+    if not has_tauri and frontendish and not backendish:
         return "node-react"
-    if "backend" in task or "api" in task or "server" in task:
+
+    if has_rust and ("api" in interfaces or "db" in interfaces) and not (frontendish and has_web):
         return "rust-tauri"
-    if "API" in interfaces or "DB" in interfaces:
+
+    if backendish or "backend" in task:
         return "rust-tauri"
-    return "rust-tauri"  # default: Rust, Tauri, React, CSS
+
+    return "rust-tauri"
+
+
+def _prune_empty_rust_scaffold(hlig_dir: Path) -> None:
+    """Remove Cargo stub from a prior rust-tauri mis-inference when this HLIG is node-react."""
+    cargo = hlig_dir / "Cargo.toml"
+    main_rs = hlig_dir / "src" / "main.rs"
+    if not cargo.is_file() or not main_rs.is_file():
+        return
+    rs_files = [
+        p
+        for p in hlig_dir.rglob("*.rs")
+        if "target" not in p.parts and "node_modules" not in p.parts
+    ]
+    if len(rs_files) != 1:
+        return
+    try:
+        if rs_files[0].resolve() != main_rs.resolve():
+            return
+    except OSError:
+        return
+    body = main_rs.read_text(encoding="utf-8", errors="replace")
+    decommented = "\n".join(line.partition("//")[0] for line in body.splitlines())
+    compact = re.sub(r"\s+", "", decommented)
+    if compact != "fnmain(){}":
+        return
+    ct = cargo.read_text(encoding="utf-8", errors="replace")
+    if "[package]" not in ct or "src/main.rs" not in ct:
+        return
+    try:
+        cargo.unlink()
+        main_rs.unlink()
+    except OSError:
+        return
+    rtc = hlig_dir / "rust-toolchain.toml"
+    if rtc.is_file():
+        try:
+            rtxt = rtc.read_text(encoding="utf-8", errors="replace")
+            if "[toolchain]" in rtxt and 'channel = "stable"' in rtxt:
+                rtc.unlink()
+        except OSError:
+            pass
+    src = hlig_dir / "src"
+    try:
+        if src.is_dir() and not any(src.iterdir()):
+            src.rmdir()
+    except OSError:
+        pass
 
 
 # Rust first build can be slow (cargo fetch + compile); use longer timeout
@@ -353,6 +550,10 @@ def _env_truthy(name: str, default: str = "1") -> bool:
     """True unless env is 0/false/no/off (case-insensitive)."""
     v = os.environ.get(name, default).strip().lower()
     return v not in ("0", "false", "no", "off")
+
+
+def _ig_code_review_enabled() -> bool:
+    return _env_truthy("ENABLE_IG_CODE_REVIEW", "1")
 
 
 def _any_src_files_for_tsc(hlig_dir: Path) -> bool:
@@ -786,6 +987,16 @@ def _parse_build_failure_hints(stderr: str, framework: str) -> str:
         if "failed to parse source for import analysis" in err and "jsx" in err:
             hints.append(
                 "Vite: JSX in a .js file is invalid. Use .jsx/.tsx for components and entry, or output plain JS without JSX syntax."
+            )
+        if (
+            "failed to load config" in err
+            or "dynamic require" in err.lower()
+            or "commonjs-variable-in-esm" in err.replace("_", "").lower()
+            or ("module.exports" in err and "vite.config" in err.replace(" ", "").lower())
+        ):
+            hints.append(
+                "Vite config: if package.json has \"type\": \"module\", use ESM in vite.config.js (import { defineConfig } from 'vite'; export default defineConfig({...})). "
+                "Do not use module.exports in vite.config.js — rename to vite.config.cjs for CommonJS or switch the config to import/export."
             )
         if "default" in err and "is not exported" in err and ("rollup" in err or "vite" in err or ".tsx" in err or ".jsx" in err):
             hints.append(
@@ -1381,6 +1592,12 @@ class DTGArtifactGenerator:
         design_docs_available: bool = True,
         implementation_brief: str | None = None,
         previous_attempt_files: dict[str, str] | None = None,
+        same_node_prior_files: dict[str, str] | None = None,
+        mechanical_validation_errors: str | None = None,
+        codegen_phase: str | None = None,
+        current_file_skeleton: str | None = None,
+        module_interface_snapshots: list[dict[str, str]] | None = None,
+        shared_interfaces_excerpt: str | None = None,
     ) -> dict[str, str]:
         """
         Generate code files for a DTG code node. Returns {path: content}.
@@ -1414,6 +1631,20 @@ class DTGArtifactGenerator:
             input_data["previous_attempt_files"] = previous_attempt_files
         if implementation_brief:
             input_data["implementation_brief"] = implementation_brief
+        if same_node_prior_files:
+            input_data["same_node_prior_files"] = {
+                k: _truncate_same_node_prior(v) for k, v in sorted(same_node_prior_files.items())
+            }
+        if mechanical_validation_errors:
+            input_data["mechanical_validation_errors"] = mechanical_validation_errors
+        if codegen_phase:
+            input_data["codegen_phase"] = codegen_phase
+        if current_file_skeleton is not None:
+            input_data["current_file_skeleton"] = current_file_skeleton
+        if module_interface_snapshots:
+            input_data["module_interface_snapshots"] = build_snapshots_payload(module_interface_snapshots)
+        if shared_interfaces_excerpt:
+            input_data["shared_interfaces_json_excerpt"] = shared_interfaces_excerpt
         try:
             response = self._call_llm(prompt, input_data, session_id)
         except CostLimitExceeded:
@@ -1446,8 +1677,40 @@ class DTGArtifactGenerator:
         except Exception:
             return {}
 
+    def _review_ig_file(
+        self,
+        session_id: str,
+        *,
+        dtg_node: dict,
+        file_path: str,
+        content: str,
+        framework: str,
+    ) -> tuple[str, str]:
+        if not _ig_code_review_enabled():
+            return "pass", ""
+        prompt = self._load_prompt("code_reviewer")
+        if not prompt:
+            return "pass", ""
+        max_chars = _ctx_limit("IG_REVIEW_FILE_MAX_CHARS", 24_000)
+        trimmed = content if max_chars <= 0 else content[:max_chars]
+        input_data = {
+            "review_scope": "single_file",
+            "framework": framework,
+            "file_path": file_path,
+            "file_content": trimmed,
+            "dtg_node": {
+                "id": dtg_node.get("id", ""),
+                "title": dtg_node.get("title", ""),
+                "description": (dtg_node.get("description") or "")[:4000],
+            },
+        }
+        raw = self._call_llm(prompt, input_data, session_id, agent_name="code_reviewer_ig")
+        return _parse_code_reviewer_status(raw), raw
+
     def _scaffold_project(self, hlig_dir: Path, framework: str, hlig_node: dict) -> None:
         """Create minimal package.json or Cargo.toml so project is buildable. For Rust, ensure [[bin]] and src/main.rs exist."""
+        if framework == "node-react":
+            _prune_empty_rust_scaffold(hlig_dir)
         if framework == "rust-tauri":
             cargo = hlig_dir / "Cargo.toml"
             name = _safe_filename(hlig_node.get("id", "app")).lower()
@@ -1463,6 +1726,12 @@ path = "src/main.rs"
 
 [dependencies]
 ''', encoding="utf-8")
+                rtc = hlig_dir / "rust-toolchain.toml"
+                if not rtc.exists():
+                    rtc.write_text(
+                        '[toolchain]\nchannel = "stable"\n',
+                        encoding="utf-8",
+                    )
             else:
                 content = cargo.read_text(encoding="utf-8")
                 if "[[bin]]" not in content and "[lib]" not in content:
@@ -1477,7 +1746,8 @@ path = "src/main.rs"
             src_dir = hlig_dir / "src"
             index_js = src_dir / "index.js"
             if not pkg.exists():
-                pkg.write_text('''{
+                pkg.write_text(
+                    """{
   "name": "hlig-generated",
   "version": "1.0.0",
   "type": "module",
@@ -1485,9 +1755,20 @@ path = "src/main.rs"
     "dev": "node src/index.js",
     "build": "node --no-warnings src/index.js",
     "start": "node src/index.js"
+  },
+  "devDependencies": {
+    "prettier": "^3.4.2"
   }
 }
-''', encoding="utf-8")
+""",
+                    encoding="utf-8",
+                )
+                prc = hlig_dir / ".prettierrc.json"
+                if not prc.exists():
+                    prc.write_text(
+                        '{\n  "semi": true,\n  "singleQuote": true\n}\n',
+                        encoding="utf-8",
+                    )
                 src_dir.mkdir(parents=True, exist_ok=True)
                 if not index_js.exists():
                     index_js.write_text(
@@ -1603,35 +1884,289 @@ path = "src/main.rs"
     ) -> None:
         """
         Generate one code-type DTG node, run local build; on failure retry LLM for this node only.
-        After max retries, raises LocalBuildFailedError only if ABORT_ON_LOCAL_BUILD_FAILURE=1; otherwise continues.
+        After max retries, raises LocalBuildFailedError by default; set ABORT_ON_LOCAL_BUILD_FAILURE=0 to continue.
         """
         nid = node.get("id", "")
         deps = node.get("dependencies") or []
         iface_defs = _get_interfaces_for_hlig(hlig_graph, hlig_id) if hlig_graph else None
+        contracts = iface_defs if iface_defs else []
+        tech_stack = {"framework": framework}
+        shared_iface_excerpt = load_shared_interfaces_excerpt(
+            hlig_dir.parent, _shared_interfaces_max_chars()
+        )
+        module_snapshots: list[dict[str, str]] = []
         compile_errors: str | None = None
         previous_attempt_files: dict[str, str] | None = None
         last_err = ""
         max_extra = _per_node_build_max_retries()
+        files: dict[str, str] = {}
+        ig_record: dict[str, Any] | None = None
+
         for attempt in range(max_extra + 1):
             dep_ctx = _build_dep_ctx(deps, resolved, nodes_by_id)
             impl_brief = _build_implementation_brief(dep_ctx, iface_defs, node, framework)
-            files = self._generate_code(
-                node,
-                framework,
-                dep_ctx,
+            ig_tasks = expand_dtg_node(node, contracts, tech_stack, project_root=hlig_dir)
+            log_pipeline_event(
                 session_id,
-                causal_path=causal_path,
-                causal_parent_context=causal_parent_context,
-                interface_definitions=iface_defs,
-                compile_errors=compile_errors,
-                design_docs_available=design_docs_available,
-                implementation_brief=impl_brief,
-                previous_attempt_files=previous_attempt_files,
+                "dtg_ig_expansion",
+                {
+                    "dtg_node_id": nid,
+                    "ig_task_paths": [t.get("file_path") for t in ig_tasks],
+                    "ig_task_count": len(ig_tasks),
+                },
             )
-            for rel_path, content in files.items():
-                full_path = hlig_dir / rel_path
-                full_path.parent.mkdir(parents=True, exist_ok=True)
-                full_path.write_text(content, encoding="utf-8")
+
+            node_files: dict[str, str] = {}
+            expected_ig_files = sum(
+                1 for t in ig_tasks if isinstance(t, dict) and str(t.get("file_path") or "").strip()
+            )
+            ig_paths_ordered = [
+                str(t.get("file_path")).strip()
+                for t in ig_tasks
+                if isinstance(t, dict) and str(t.get("file_path") or "").strip()
+            ]
+
+            if not ig_tasks:
+                max_steps = _ig_code_step_max_iterations()
+                mech_err: str | None = None
+                node_files = {}
+                for step in range(max_steps):
+                    node_files = self._generate_code(
+                        node,
+                        framework,
+                        dep_ctx,
+                        session_id,
+                        causal_path=causal_path,
+                        causal_parent_context=causal_parent_context,
+                        interface_definitions=iface_defs,
+                        compile_errors=compile_errors,
+                        design_docs_available=design_docs_available,
+                        implementation_brief=impl_brief,
+                        previous_attempt_files=previous_attempt_files,
+                        mechanical_validation_errors=mech_err,
+                        shared_interfaces_excerpt=shared_iface_excerpt or None,
+                    )
+                    if not node_files:
+                        mech_err = None
+                        continue
+                    bad_parts: list[str] = []
+                    for rel_path, content in list(node_files.items()):
+                        ok, msg, fixed = validate_generated_content(
+                            rel_path, content, framework, project_root=hlig_dir
+                        )
+                        if fixed is not None:
+                            node_files[rel_path] = fixed
+                        if not ok:
+                            bad_parts.append(f"{rel_path}: {msg}")
+                    if not bad_parts:
+                        break
+                    mech_err = "Fix mechanical validation errors:\n" + "\n".join(bad_parts)
+                    log_pipeline_event(
+                        session_id,
+                        "mechanical_validation_failed",
+                        {"node": nid, "attempt": step + 1, "summary": mech_err[:1200]},
+                    )
+                for rel_path, content in node_files.items():
+                    full_path = hlig_dir / rel_path
+                    full_path.parent.mkdir(parents=True, exist_ok=True)
+                    full_path.write_text(content, encoding="utf-8")
+                ig_record = {
+                    "node_id": nid,
+                    "section": node.get("section") or "",
+                    "dtg_node_id": nid,
+                    "expanded_ig": sorted(node_files.keys()),
+                    "status": "success" if node_files else "failure",
+                }
+            else:
+                per_file_review_failed = False
+                per_file_mechanical_failed = False
+                for ig_task in ig_tasks:
+                    fp = str(ig_task.get("file_path") or "").strip()
+                    if not fp:
+                        continue
+                    sub_node = {**node, "files_owned": [fp]}
+                    prior = {k: v for k, v in sorted(node_files.items()) if k != fp}
+                    content = ""
+                    last_review = "pass"
+                    mech_err: str | None = None
+                    mech_ok_final = False
+                    for step in range(_ig_code_step_max_iterations()):
+                        prev_files: dict[str, str] | None = None
+                        if previous_attempt_files:
+                            prev_files = previous_attempt_files
+                        elif step > 0 and content:
+                            prev_files = {fp: content}
+                        base_kw: dict[str, Any] = {
+                            "causal_path": causal_path,
+                            "causal_parent_context": causal_parent_context,
+                            "interface_definitions": iface_defs,
+                            "compile_errors": compile_errors,
+                            "design_docs_available": design_docs_available,
+                            "implementation_brief": impl_brief,
+                            "previous_attempt_files": prev_files,
+                            "same_node_prior_files": prior or None,
+                            "mechanical_validation_errors": mech_err,
+                            "module_interface_snapshots": list(module_snapshots) if module_snapshots else None,
+                            "shared_interfaces_excerpt": shared_iface_excerpt or None,
+                        }
+                        if not content:
+                            if step == 0 and _ig_two_phase_enabled() and _ig_two_phase_eligible(fp):
+                                sk = self._generate_code(
+                                    sub_node,
+                                    framework,
+                                    dep_ctx,
+                                    session_id,
+                                    codegen_phase="skeleton",
+                                    **base_kw,
+                                )
+                                sb = sk.get(fp, "") or ""
+                                if sb:
+                                    chunk = self._generate_code(
+                                        sub_node,
+                                        framework,
+                                        dep_ctx,
+                                        session_id,
+                                        codegen_phase="implement",
+                                        current_file_skeleton=sb,
+                                        **base_kw,
+                                    )
+                                    content = chunk.get(fp, "") or ""
+                            if not content:
+                                chunk = self._generate_code(
+                                    sub_node,
+                                    framework,
+                                    dep_ctx,
+                                    session_id,
+                                    **base_kw,
+                                )
+                                content = chunk.get(fp, "") or ""
+                        if not content:
+                            mech_err = None
+                            continue
+                        ok_m, msg_m, fixed_m = validate_generated_content(
+                            fp, content, framework, project_root=hlig_dir
+                        )
+                        if fixed_m is not None:
+                            content = fixed_m
+                        if not ok_m:
+                            mech_err = f"{fp}: {msg_m}"
+                            log_pipeline_event(
+                                session_id,
+                                "mechanical_validation_failed",
+                                {
+                                    "path": fp,
+                                    "node": nid,
+                                    "step": step + 1,
+                                    "error": msg_m[:500],
+                                },
+                            )
+                            content = ""
+                            continue
+                        st, _raw = self._review_ig_file(
+                            session_id,
+                            dtg_node=node,
+                            file_path=fp,
+                            content=content,
+                            framework=framework,
+                        )
+                        last_review = st
+                        if st == "fail":
+                            mech_err = None
+                            content = ""
+                            continue
+                        full_path = hlig_dir / fp
+                        full_path.parent.mkdir(parents=True, exist_ok=True)
+                        full_path.write_text(content, encoding="utf-8")
+                        ok_tool, msg_tool = extra_toolchain_validate(fp, content, framework, hlig_dir)
+                        if not ok_tool:
+                            mech_err = f"{fp} (toolchain): {msg_tool}"
+                            log_pipeline_event(
+                                session_id,
+                                "toolchain_validation_failed",
+                                {
+                                    "path": fp,
+                                    "node": nid,
+                                    "step": step + 1,
+                                    "error": msg_tool[:600],
+                                },
+                            )
+                            content = ""
+                            continue
+                        if framework == "rust-tauri":
+                            cok, cerr = run_incremental_cargo_check(hlig_dir)
+                            if not cok:
+                                mech_err = f"cargo check:\n{cerr}"
+                                log_pipeline_event(
+                                    session_id,
+                                    "incremental_cargo_check_failed",
+                                    {
+                                        "path": fp,
+                                        "node": nid,
+                                        "preview": cerr[:600],
+                                    },
+                                )
+                                content = ""
+                                continue
+                        mech_err = None
+                        mech_ok_final = True
+                        break
+                    if mech_ok_final:
+                        node_files[fp] = content
+                        module_snapshots.append(
+                            {
+                                "path": fp,
+                                "public_surface": extract_public_surface(fp, content),
+                            }
+                        )
+                    elif content:
+                        full_path = hlig_dir / fp
+                        full_path.parent.mkdir(parents=True, exist_ok=True)
+                        full_path.write_text(content, encoding="utf-8")
+                        node_files[fp] = content
+                        if last_review != "fail":
+                            per_file_mechanical_failed = True
+                    if last_review == "fail":
+                        per_file_review_failed = True
+                ig_log_status = (
+                    "failure"
+                    if per_file_review_failed
+                    or per_file_mechanical_failed
+                    or len(node_files) < expected_ig_files
+                    else "success"
+                )
+                ig_record = {
+                    "node_id": nid,
+                    "section": node.get("section") or "",
+                    "dtg_node_id": nid,
+                    "expanded_ig": list(ig_paths_ordered),
+                    "status": ig_log_status,
+                }
+
+            files = node_files
+            if framework == "rust-tauri" and files:
+                ok_rw, rw_msg = validate_rust_workspace_coherence(hlig_dir)
+                if not ok_rw:
+                    last_err = rw_msg[:4000]
+                    compile_errors = (
+                        "Rust workspace coherence check failed. "
+                        "Emit every `src/*.rs` module referenced by `use crate::…`, "
+                        "and add every external crate you use to Cargo.toml.\n\n"
+                        + rw_msg
+                    )
+                    previous_attempt_files = _snapshot_project_files_for_retry(
+                        hlig_dir, framework, files
+                    )
+                    log_pipeline_event(
+                        session_id,
+                        "rust_workspace_coherence_retry",
+                        {
+                            "hlig": hlig_id,
+                            "dtg_node": nid,
+                            "attempt": attempt + 1,
+                            "summary": rw_msg[:1200],
+                        },
+                    )
+                    continue
             if files:
                 resolved[nid] = _make_code_output_spec(nid, list(files.items()))
                 log_pipeline_event(session_id, "code_generated", {"node": nid, "files": list(files.keys())})
@@ -1639,6 +2174,8 @@ path = "src/main.rs"
             readme_paths = generated_design + generated_code_paths + list(files.keys())
             self._write_readme(hlig_dir, hlig_node, framework, readme_paths)
             if not enable_local_build:
+                if ig_record:
+                    _append_ig_execution_log(hlig_dir, ig_record)
                 for p in files:
                     if p not in generated_code_paths:
                         generated_code_paths.append(p)
@@ -1652,6 +2189,8 @@ path = "src/main.rs"
             success, out, err = _run_local_build(hlig_dir, framework)
             _write_build_log(hlig_dir, success, out, err)
             if success:
+                if ig_record:
+                    _append_ig_execution_log(hlig_dir, ig_record)
                 log_pipeline_event(
                     session_id,
                     "local_build_ok",
@@ -1680,6 +2219,11 @@ path = "src/main.rs"
                     "previous_files_keys": list(previous_attempt_files.keys()) if previous_attempt_files else [],
                 },
             )
+        if ig_record is not None:
+            _append_ig_execution_log(
+                hlig_dir,
+                {**ig_record, "status": "failure"},
+            )
         if _abort_on_local_build_failure():
             raise LocalBuildFailedError(
                 f"Local build failed for HLIG {hlig_id} DTG node {nid} after {max_extra + 1} attempt(s). "
@@ -1694,7 +2238,7 @@ path = "src/main.rs"
             {
                 "hlig": hlig_id,
                 "dtg_node": nid,
-                "reason": "local build failed after retries; continuing (set ABORT_ON_LOCAL_BUILD_FAILURE=1 to stop)",
+                "reason": "local build failed after retries; continuing (ABORT_ON_LOCAL_BUILD_FAILURE=0)",
             },
         )
         for p in files:
@@ -1745,8 +2289,7 @@ path = "src/main.rs"
         # Design nodes run once
         for node in order:
             nid = node.get("id", "")
-            task_type = (node.get("task_type") or "").lower()
-            if task_type not in ("design", "documentation"):
+            if not is_design_like_node(node):
                 continue
             deps = node.get("dependencies") or []
             dep_ctx = _build_dep_ctx(deps, resolved, nodes_by_id)
@@ -1766,8 +2309,7 @@ path = "src/main.rs"
         enable_local_build = os.environ.get("ENABLE_LOCAL_BUILD", "1").strip().lower() not in ("0", "false", "no")
         generated_code_paths: list[str] = []
         for node in order:
-            task_type = (node.get("task_type") or "").lower()
-            if task_type not in ("code", "integration", "test", "build", "verification"):
+            if not is_code_execution_node(node):
                 continue
             self._execute_code_node_with_per_node_build(
                 node=node,
@@ -1861,8 +2403,7 @@ path = "src/main.rs"
                 order = _topological_order(dtg)
                 resolved: dict[str, str] = {}
                 for node in order:
-                    task_type = (node.get("task_type") or "").lower()
-                    if task_type not in ("design", "documentation"):
+                    if not is_design_like_node(node):
                         continue
                     nid2 = node.get("id", "")
                     deps = node.get("dependencies") or []
@@ -1946,8 +2487,7 @@ path = "src/main.rs"
                 self._scaffold_project(hlig_dir, framework, hlig_node)
                 generated_code_paths: list[str] = []
                 for node in order:
-                    task_type = (node.get("task_type") or "").lower()
-                    if task_type not in ("code", "integration", "test", "build", "verification"):
+                    if not is_code_execution_node(node):
                         continue
                     self._execute_code_node_with_per_node_build(
                         node=node,

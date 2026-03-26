@@ -13,6 +13,13 @@ You will receive:
 - `implementation_brief`: **Full design-based prompt** summarizing what to implement. When present, **use this as the primary source of requirements**: it includes implementation steps, architecture, constraints, required interfaces, and the compilation requirement. Follow it in addition to the main coder prompt.
 - `compile_errors` (optional): If present, the previous build failed. Contains **stdout and stderr** from the build (`cargo check` / `npm run build` / etc.) plus **Hints to fix** from the pipeline. Use these messages to locate failing files and error kinds.
 - `previous_attempt_files` (optional): If present together with `compile_errors`, this is a map **`path` → full file content** for the project after the failed build. It includes the files this node last wrote (read from disk, so post-processing edits to `Cargo.toml` / `package.json` are included) plus manifests. **Edit these files to fix the errors** and return the **complete** corrected `files` array in your JSON output—do not rely on truncated `content_preview` in `dependency_context` for the current node’s own prior output.
+- `same_node_prior_files` (optional): Map **`path` → content preview** for files already generated earlier in the **same** DTG node (file-level implementation steps). Keep imports, exports, and types consistent with these paths; do not duplicate or contradict them.
+- `mechanical_validation_errors` (optional): Tool output from **syntax / parse / formatter checks** (e.g. `rustfmt --check`, `node --check`, JSON/TOML parse). When present, fix the affected file(s) so the next response passes those checks—resolve parse errors, balance delimiters, and valid formatting before returning `files`.
+- `shared_interfaces_json_excerpt` (optional): JSON excerpt from **`shared/interfaces.json`** at the session outputs root (HLIG cross-subsystem contracts: `by_edge`, endpoints, schemas). When present, **align names, routes, and types** with this contract so frontend/backend integration stays consistent. Do not invent conflicting paths or payload shapes.
+- `module_interface_snapshots` (optional): Array of `{ "path", "public_surface" }` for files **already generated earlier in the same DTG node** (heuristic lines: `pub` items / `export` lines). Treat these as the **authoritative public names** for cross-file imports and re-exports in the current file—match them exactly unless the brief requires a deliberate change.
+- `codegen_phase` (optional): When set to **`skeleton`**, emit only **structure** for `files_owned`: module layout, `pub` signatures, structs/enums, function signatures, exports/imports wiring, and **minimal bodies** (`todo!()`, `unimplemented!()`, `throw new Error("TODO")`, empty components returning a placeholder). No heavy business logic.
+- `codegen_phase` **`implement`** with `current_file_skeleton` (optional): You receive the **previous skeleton** for the same path. **Fill in bodies** and replace placeholders; **do not rename** public types, functions, or exports from the skeleton unless `mechanical_validation_errors` or `compile_errors` require a fix.
+- When `codegen_phase` is omitted, produce **complete, runnable** code as usual.
 
 **dependency_context value types** (parse JSON; check `type` field):
 
@@ -55,6 +62,7 @@ Parse the JSON and follow `implementation_instructions` from design_spec when pr
 - **API client:** Export from your api/client module every function that hooks and components import (e.g. fetchAboutContent, fetchMenuPdf).
 - **ESM default vs named exports (Vite/Rollup):** If a module uses `export { foo, bar }` or `export function foo`, consumers must use **`import { foo } from '...'`**. If you use **`import foo from '...'`** (default import), the module must **`export default foo`**. Mismatches cause: `"default" is not exported by "src/...".tsx`. Keep hooks (`useX`) and API helpers consistent: either default-export one primary symbol or named-export everything and match imports.
 - **tsconfig.json:** Valid JSON only. Do not add "types" for packages not in package.json (e.g. testing-library__jest-dom). Use "vite/client" for import.meta.env. Prefer build script "vite build" only (no tsc in build) so test type errors do not block the app build.
+- **Vite config vs `package.json` `"type": "module"`:** If `package.json` sets **`"type": "module"`** (recommended for Vite + React), then **`vite.config.js`** MUST be **ESM**: use **`import { defineConfig } from 'vite'`** (and `import react from '@vitejs/plugin-react'` etc.) and **`export default defineConfig({ ... })`**. Do **not** use **`module.exports`** or **`require()`** in `vite.config.js` — that breaks Node/Vite (`failed to load config`, `Dynamic require ... is not supported`, `commonjs-variable-in-esm`). If you truly need CommonJS for the config file, name it **`vite.config.cjs`** and use `module.exports` there (leave `"type": "module"` in `package.json` for `src/`).
 
 ### rust-tauri (Rust + Tauri)
 - Use Rust 2021 edition
@@ -79,6 +87,13 @@ Parse the JSON and follow `implementation_instructions` from design_spec when pr
   - If you **`use anyhow::`** or **`clap::`** / **`#[derive(Parser)]`**, list **`anyhow`** and **`clap`** in **`Cargo.toml`** (matrix-pinned versions in `implementation_brief`).
 - Structure: `src/main.rs`, `src/lib.rs` as needed
 - Include build instructions: `cargo build`, `cargo run`
+- **Crate layout and `crate::` imports (critical — avoids E0432/E0433):**
+  - **`use crate::foo::...` is only valid** if the **same crate** defines module `foo`: either **`src/foo.rs`**, **`src/foo/mod.rs`**, or an **inline** `mod foo { ... }` in `main.rs` / `lib.rs`.
+  - **Never** emit `main.rs` (or `lib.rs`) that imports `crate::errors`, `crate::static_server`, `crate::file_watcher`, etc. **unless you also emit** the matching `src/errors.rs`, `src/static_server.rs`, … (or declare an inline `mod` with a body in the same file).
+  - **Binary-only package:** If you only have `[[bin]]` + `src/main.rs` and **no** `[lib]`, then all `mod name;` declarations must point to real files under `src/`. Integration tests in `tests/*.rs` link to the **library** only: add **`[lib]`** + `src/lib.rs` that `pub mod`’s the API you want to test, and in tests use **`use your_package_name::...`**, not `use crate::...` (in `tests/`, `crate::` is the *test crate*, not your app).
+  - **Logging:** If you use **`log::info!`** / **`log::error!`** / etc., add **`log`** to **`[dependencies]`** in `Cargo.toml`. If you use **`env_logger::init`** (or `init_from_env`), add **`env_logger`** to **`[dependencies]`** (or `[dev-dependencies]` only if exclusively used from tests).
+  - **Dev-only crates:** If **`tests/*.rs`** use **`tempfile`**, **`reqwest`**, **`tokio::test`**, etc., declare them under **`[dev-dependencies]`** in `Cargo.toml`.
+  - **Single response must be self-consistent:** Every path implied by `mod x;`, `use crate::x::`, and `Cargo.toml` must appear in the **`files`** array in **this** JSON output (or already exist from a prior node without contradiction). Do not leave “stub” imports for the next node to implement unless the DTG truly split ownership and prior nodes already wrote those files.
 - **Modules:** Do not create both `src/X.rs` and `src/X/mod.rs` for the same module; use one.
 - **Syntax:** Use semicolons after statement expressions where required (e.g. before `Ok(())` or the next statement).
 - **Tauri features and config:** Do not invent Tauri features such as `api-all`, `ipc-all`, `shell-open`, or `disable-devtools`; use only the features and versions listed in the dependency matrix. `tauri.conf.json` must match the pinned template and schema (no `devPath` or `package` fields; required fields like `identifier` must be present). If you modify Tauri config, change only allowed keys and keep the overall structure consistent with the version in the implementation_brief.
@@ -134,6 +149,9 @@ Your output **must** compile and build without errors. The system will run `carg
 
 **Rust (`rust-tauri` / backend):**
 - [ ] `Cargo.toml` has `[[bin]]` → `src/main.rs` and/or `[lib]` → `src/lib.rs`, and those files exist.
+- [ ] Every **`use crate::foo`** has a matching **`src/foo.rs`** or **`src/foo/mod.rs`** or inline **`mod foo { }`** in `main.rs`/`lib.rs`; no orphan internal modules.
+- [ ] **`log` / `env_logger` / `tracing` / `anyhow` / `clap`:** if referenced in code, listed in `Cargo.toml` in the right table (`[dependencies]` vs `[dev-dependencies]` for test-only use).
+- [ ] Integration tests under **`tests/`** use **`use <package_name>::...`** for the library API, or the project has **`[lib]`** re-exporting the modules under test — not `use crate::...` for app modules unless you understand the test-crate root.
 - [ ] Every dependency appears in `Cargo.toml` with versions/features aligned to the matrix (no orphan `use` of crates you did not declare).
 - [ ] If the app uses DB migrations: `migrations/` exists next to `Cargo.toml` with dated subfolders and **`up.sql`** files; migrations are applied via **`batch_execute`** (or equivalent) per **`diesel_sqlite_rules`**, not **`embed_migrations!`**.
 - [ ] If using Argon2: `rand_core` has **`getrandom`** feature (or `rand` + `OsRng`); salt via **`SaltString::generate`**, not `OsRng` as `hash_password`’s second arg; password errors mapped for `anyhow`.
@@ -143,6 +161,7 @@ Your output **must** compile and build without errors. The system will run `carg
 
 **Node / React (`node-react`):**
 - [ ] `package.json` has `build` (prefer `"vite build"`), `index.html` at project root, and script `src` matches a real `.jsx`/`.tsx` entry.
+- [ ] If `"type": "module"`: `vite.config.js` uses **`import` / `export default defineConfig(...)`** (ESM), **or** the config is **`vite.config.cjs`** with `module.exports` — never CJS `module.exports` inside `vite.config.js` with `"type": "module"`.
 - [ ] JSX only in `.jsx` / `.tsx`; `tsconfig.json` is valid JSON and matches installed packages.
 - [ ] Default vs named `import`/`export` is consistent across hooks, API modules, and pages.
 - [ ] If TypeScript is used: `typescript` is in devDependencies and `tsconfig.json` exists.

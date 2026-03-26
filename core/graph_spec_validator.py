@@ -11,6 +11,13 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from core.expansion_engine import (
+    DTG_LOGICAL_TYPES,
+    EXPANSION_STRATEGIES,
+    effective_dtg_type,
+    needs_expansion_strategy,
+)
+
 try:
     import networkx as nx
 except ImportError:
@@ -36,7 +43,17 @@ DTG_REQUIRED_NODE = {
     "dependencies",
     "success_criteria",
 }
-DTG_OPTIONAL_NODE = {"node_type", "output_descriptions", "execution_spec", "parent_hlig", "language", "files_owned"}
+DTG_OPTIONAL_NODE = {
+    "node_type",
+    "output_descriptions",
+    "execution_spec",
+    "parent_hlig",
+    "language",
+    "files_owned",
+    "expansion_strategy",
+    "type",
+    "section",
+}
 DTG_TASK_TYPES = {
     "design",
     "code",
@@ -46,6 +63,7 @@ DTG_TASK_TYPES = {
     "verification",
     "build",
     "review",
+    "contract",
 }
 DTG_NODE_TYPES = {"reasoning", "design", "coding", "evaluation", "tool"}
 EDGE_TYPES = {"control", "data"}
@@ -163,6 +181,44 @@ def validate_hlig(data: dict, strict_canonical_names: bool = False) -> list[str]
     return errs
 
 
+def contract_first_warnings(nodes: list[dict]) -> list[str]:
+    """
+    Warn when a code-logical node depends only on other code-logical nodes (no contract/design in deps).
+    Soft policy; does not fail validation.
+    """
+    by_id = {n.get("id"): n for n in nodes if n.get("id")}
+    warns: list[str] = []
+    for n in nodes:
+        nid = n.get("id")
+        if not nid or effective_dtg_type(n) != "code":
+            continue
+        deps = n.get("dependencies") or []
+        if not deps:
+            continue
+        dep_nodes = [by_id[d] for d in deps if d in by_id]
+        if len(dep_nodes) != len(deps):
+            continue
+        if dep_nodes and all(effective_dtg_type(dn) == "code" for dn in dep_nodes):
+            warns.append(
+                f"DTG node '{nid}': code node depends only on other code nodes; "
+                "prefer a contract or design node between modules (contract-first)."
+            )
+    return warns
+
+
+def section_warnings(nodes: list[dict]) -> list[str]:
+    """Recommend non-empty section for readability (prompts/dtg_generator.md)."""
+    warns: list[str] = []
+    for n in nodes:
+        nid = n.get("id", "?")
+        sec = n.get("section")
+        if sec is None or (isinstance(sec, str) and not sec.strip()):
+            warns.append(
+                f"DTG node '{nid}': missing or empty 'section' (recommended for grouped, readable DTGs)."
+            )
+    return warns
+
+
 def validate_dtg(dtg: dict, hlig_node_id: str | None = None) -> list[str]:
     """
     Validate a single DTG (hlig_node_id, nodes, edges) against language_readme.md Section 4.
@@ -200,6 +256,27 @@ def validate_dtg(dtg: dict, hlig_node_id: str | None = None) -> list[str]:
         nt = n.get("node_type")
         if nt and nt not in DTG_NODE_TYPES:
             errs.append(f"DTG node '{nid}': node_type '{nt}' not in {DTG_NODE_TYPES}")
+
+        ty = n.get("type")
+        if ty is not None:
+            if not isinstance(ty, str) or not str(ty).strip():
+                errs.append(f"DTG node '{nid}': 'type' must be a non-empty string when present")
+            elif str(ty).strip().lower() not in DTG_LOGICAL_TYPES:
+                errs.append(
+                    f"DTG node '{nid}': type '{ty}' not in {sorted(DTG_LOGICAL_TYPES)}"
+                )
+
+        if needs_expansion_strategy(n):
+            es = n.get("expansion_strategy")
+            if not es or not isinstance(es, str) or not es.strip():
+                errs.append(
+                    f"DTG node '{nid}': expansion_strategy is required for logical type "
+                    f"'{effective_dtg_type(n)}' (code/test/build)"
+                )
+            elif es.strip() not in EXPANSION_STRATEGIES:
+                errs.append(
+                    f"DTG node '{nid}': expansion_strategy '{es}' not in {sorted(EXPANSION_STRATEGIES)}"
+                )
 
         out = n.get("outputs_produced")
         if isinstance(out, list):
@@ -301,6 +378,13 @@ def validate_graph(data: dict, strict_canonical_names: bool = False) -> dict[str
             result["dtg_errors_by_node"][nid or "?"] = dtg_errs
             result["errors"].extend([f"[DTG {nid}] {e}" for e in dtg_errs])
             result["ok"] = False
+        dnodes = dtg.get("nodes") or []
+        if isinstance(dnodes, list):
+            prefix = f"[DTG {nid}] " if nid else ""
+            for w in contract_first_warnings(dnodes):
+                result["warnings"].append(prefix + w)
+            for w in section_warnings(dnodes):
+                result["warnings"].append(prefix + w)
 
     return result
 
