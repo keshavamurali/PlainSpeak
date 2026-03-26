@@ -8,6 +8,7 @@ from typing import Any, Callable
 from context.execution_context import ExecutionContext
 from agents.base import BaseAgent
 from core.plan_graph import PlanGraph
+from core.expansion_engine import EXPANSION_STRATEGIES, default_expansion_strategy_for_node
 from core.hlig_dtg_graphs import HLIGGraph, DTGGraph, GraphCycleError
 
 try:
@@ -148,6 +149,11 @@ class AgentRunner:
             if isinstance(n, dict):
                 n["parent_hlig"] = parent_hlig
                 n["language"] = lang
+                tt = (n.get("task_type") or "").lower()
+                if tt in ("code", "integration", "test", "build", "verification"):
+                    es = (n.get("expansion_strategy") or "").strip()
+                    if not es or es not in EXPANSION_STRATEGIES:
+                        n["expansion_strategy"] = default_expansion_strategy_for_node(parent_hlig, n)
         return dtg_out
 
     def _generate_dtgs_for_hlig(self, ctx: ExecutionContext, hlig_graph: HLIGGraph, steps: dict) -> None:
@@ -373,6 +379,7 @@ class AgentRunner:
             input_data = {
                 "hlig_graph": ctx.hlig_graph.to_dict() if ctx.hlig_graph and hasattr(ctx.hlig_graph, "to_dict") else {},
                 "original_query": ctx.globals_schema.get("original_query", ctx.get_state("query", "")),
+                "user_clarification": ctx.globals_schema.get("user_clarification", ""),
                 "artifact_outputs_path": ctx.globals_schema.get("artifact_outputs_path", ""),
             }
             agent = BaseAgent(
@@ -432,6 +439,7 @@ class AgentRunner:
                 "artifact_outputs_path": ctx.globals_schema.get("artifact_outputs_path", ""),
                 "hlig_graph": ctx.hlig_graph.to_dict() if ctx.hlig_graph and hasattr(ctx.hlig_graph, "to_dict") else {},
                 "original_query": ctx.globals_schema.get("original_query", ctx.get_state("query", "")),
+                "user_clarification": ctx.globals_schema.get("user_clarification", ""),
             }
             agent = BaseAgent(
                 name="code_reviewer",

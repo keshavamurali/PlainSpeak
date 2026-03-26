@@ -74,7 +74,8 @@ Each node in `nodes` must follow:
   "output_descriptions": { "canonical_artifact_name": "Short human-readable description" },
   "dependencies": ["DTG-X-A", "DTG-X-B"],
   "success_criteria": ["objective, measurable criteria"],
-  "files_owned": []
+  "files_owned": [],
+  "expansion_strategy": "frontend_app_standard"
 }
 ```
 
@@ -84,6 +85,7 @@ Each node in `nodes` must follow:
 - **`outputs_produced`**: **Canonical artifact names only.** Exact, referrable identifiers in snake_case (e.g. `architecture_spec`, `file_reader_module`). Downstream nodes will reference these exact names in their `inputs_required`. SHOULD align with or refine parent HLIG `outputs` where applicable.
 - **`output_descriptions`** (optional): Map from each artifact name in `outputs_produced` to a short human-readable description. Used for prompts and docs; dependency matching uses the names only.
 - **`files_owned`** (optional, for coding nodes only): When `task_type` is `"code"`, list the file paths (relative to project root) that this node creates or modifies. Each path must appear in exactly one node's `files_owned`. Omit or use `[]` for non-coding nodes.
+- **`expansion_strategy`** (**required** for every node whose `task_type` is `code`, `integration`, `test`, `build`, or `verification`): A string that selects how the execution engine expands this node at runtime into file-level Implementation Graph (IG) tasks. Must be one of the allowed values in **EXPANSION STRATEGY** below. Do not embed IG nodes in the DTG—only set this field.
 - `dependencies`: IDs of DTG nodes that must complete before this one.
 - `node_type`: High-level classification:
   - `design` for architectural or documentation tasks (typically when `task_type` is design/documentation)
@@ -98,6 +100,36 @@ Each node in `nodes` must follow:
 - `language`: Preferred language/framework (default: Rust, Tauri, React, CSS)
 
 Use these when passing a DTG node to an LLM for design docs or code generation.
+
+---
+
+## EXPANSION STRATEGY (CRITICAL)
+
+Each DTG node that performs implementation work (`task_type` among `code`, `integration`, `test`, `build`, `verification`) **must** define an `expansion_strategy`.
+
+This determines how the node will be expanded **at runtime** into fine-grained implementation steps (the **Implementation Graph**, IG). The expansion must be **deterministic** (no free-form LLM decomposition of the graph itself).
+
+Example:
+
+```json
+"expansion_strategy": "frontend_app_standard"
+```
+
+**Allowed values** (initial set):
+
+* `frontend_app_standard`
+* `backend_service_standard`
+* `crud_api_standard`
+* `database_schema_standard`
+* `integration_standard`
+
+**Rules:**
+
+1. Expansion must be **deterministic** for the same inputs.
+2. Expansion must produce **file-level** tasks (one primary file per IG task), driven by `files_owned` when present, otherwise by the fixed template for the strategy (see execution engine).
+3. Expansion must be driven by **contracts** (interface definitions), **`tech_stack` / framework**, and **templates**—not by ad hoc LLM reasoning about graph shape.
+
+The IG is **not** stored inside the DTG JSON; it is computed when the node runs.
 
 ---
 
@@ -181,6 +213,55 @@ Each edge in `edges` must follow:
 
 ---
 
+## RUNTIME IMPLEMENTATION GRAPH (IG)
+
+DTG nodes are **logical** units of work and may be too coarse for reliable code generation if handled as a single codegen call.
+
+At **runtime**, each implementation DTG node is expanded into an **Implementation Graph (IG)**.
+
+**IG characteristics:**
+
+* Each IG step targets **exactly one file** (one file per task).
+* IG steps are **deterministic** given the DTG node, contracts, and tech stack.
+* IG steps are derived from **`expansion_strategy`** and **`files_owned`** (or the strategy template when `files_owned` is empty).
+* IG is **not** stored in the DTG artifact.
+* IG is **generated at execution time** only.
+
+**Example**
+
+DTG node (logical):
+
+* “Implement frontend application”
+
+Runtime IG (file-level; illustrative):
+
+* create `src/components/Menu.tsx`
+* create `src/components/Gallery.tsx`
+* create `src/api/client.ts`
+* create `src/styles/main.css`
+
+---
+
+## DETERMINISTIC EXPANSION RULE
+
+Expansion from DTG → IG must be **deterministic**.
+
+Given:
+
+* the same DTG node (including `expansion_strategy` and `files_owned`),
+* the same contracts,
+* the same tech stack,
+
+the generated IG must be **identical** across runs.
+
+Do **not** rely on free-form LLM decomposition for expansion. Use:
+
+* predefined templates keyed by `expansion_strategy`,
+* contract-driven metadata (e.g. interface refs on IG tasks),
+* structured rules in the execution engine.
+
+---
+
 ## BUILD CHECKPOINT RULE
 
 A build node documents the intent to verify that the project compiles. The execution system runs one build per HLIG at the end of code generation; a DTG build node does not trigger a separate build step but clarifies the graph (e.g. design → code → build → test). Include a build node when you want to express that "compile the project" is a distinct checkpoint before tests or downstream work.
@@ -201,6 +282,7 @@ Example node:
   "title": "Compile project",
   "task_type": "build",
   "node_type": "evaluation",
+  "expansion_strategy": "integration_standard",
   "dependencies": ["DTG-X-Z"],
   "inputs_required": [],
   "outputs_produced": ["build_status"],
