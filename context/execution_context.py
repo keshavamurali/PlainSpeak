@@ -125,4 +125,7 @@ class ExecutionContext:
             d["hlig_graph"] = self.hlig_graph.to_dict()
         if self.graph_state:
             d["graph_state"] = self.graph_state.to_dict()
+            snaps = self.graph_state.snapshots_dict()
+            if snaps:
+                d["graph_execution_snapshots"] = snaps
         return d

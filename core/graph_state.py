@@ -32,10 +32,26 @@ class GraphExecutionState:
     This is intentionally generic: node_id may refer to a plan step (T000),
     an HLIG node (HLIG-X), or a DTG node (DTG-X-Y). The runner and generators
     decide which ids to record.
+
+    ``snapshots`` holds replay/debug payloads (spec, contract graph, expanded IG paths).
     """
 
     def __init__(self) -> None:
         self._nodes: Dict[str, NodeExecutionRecord] = {}
+        self.snapshots: Dict[str, Any] = {}
+
+    def record_snapshot(self, key: str, value: Any) -> None:
+        """Store a debug/replay snapshot. ``expanded_ig`` values are shallow-merged by HLIG id."""
+        if key == "expanded_ig" and isinstance(value, dict):
+            cur = self.snapshots.get("expanded_ig")
+            if not isinstance(cur, dict):
+                cur = {}
+            merged = dict(cur)
+            for k, v in value.items():
+                merged[k] = v
+            self.snapshots["expanded_ig"] = merged
+        else:
+            self.snapshots[key] = value
 
     def record_start(self, node_id: str, agent_name: str, inputs: Dict[str, Any] | None = None) -> None:
         rec = self._nodes.get(node_id)
@@ -68,6 +84,7 @@ class GraphExecutionState:
             rec.status = "completed"
 
     def to_dict(self) -> Dict[str, Any]:
+        """Per-node execution records (backward-compatible flat map by node_id)."""
         return {
             nid: {
                 "agent": r.agent_name,
@@ -81,4 +98,8 @@ class GraphExecutionState:
             }
             for nid, r in self._nodes.items()
         }
+
+    def snapshots_dict(self) -> Dict[str, Any]:
+        """Replay/debug payloads: spec_snapshot, contract_graph, expanded_ig, etc."""
+        return dict(self.snapshots)
 

@@ -167,8 +167,12 @@ class DTGGraph:
                     if "node_type" not in attrs:
                         task_type = (attrs.get("task_type") or "").lower()
                         node_type = None
-                        if task_type in ("design", "documentation"):
+                        if task_type == "contract":
+                            node_type = "contract"
+                        elif task_type in ("design", "documentation"):
                             node_type = "design"
+                        elif task_type == "scaffold":
+                            node_type = "coding"
                         elif task_type in ("code", "integration", "build", "verification"):
                             node_type = "coding"
                         elif task_type in ("test", "unit_test", "integration_test", "system_test"):

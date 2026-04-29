@@ -271,7 +271,7 @@ def _enrich_hlig_graph(hlig_graph: dict) -> dict:
                 n["language"] = lang
             if isinstance(n, dict):
                 tt = (n.get("task_type") or "").lower()
-                if tt in ("code", "integration", "test", "build", "verification"):
+                if tt in ("code", "integration", "test", "build", "verification", "scaffold"):
                     es = (n.get("expansion_strategy") or "").strip()
                     if not es or es not in EXPANSION_STRATEGIES:
                         n["expansion_strategy"] = default_expansion_strategy_for_node(parent_hlig, n)

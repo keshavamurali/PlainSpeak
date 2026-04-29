@@ -129,6 +129,42 @@ class AgentRunner:
         return None
 
     @staticmethod
+    def _normalize_planner_language(raw: Any) -> str:
+        """Match `core.dtg_artifact_generator._normalize_hlig_language_field` (avoid import cycles)."""
+        if raw is None:
+            return ""
+        if isinstance(raw, list):
+            return ", ".join(str(x).strip() for x in raw if str(x).strip())
+        return str(raw).strip()
+
+    @staticmethod
+    def _default_language_for_hlig(hlig_node: dict) -> str:
+        """
+        When the planner omits `language`, infer a primary stack from the HLIG id so DTG/codegen
+        do not all inherit an accidental full-stack string (Rust+React) on every node.
+        """
+        hid = (hlig_node.get("id") or "").upper()
+        if any(x in hid for x in ("FRONTEND", "WEB-CLIENT", "SPA-UI")):
+            return "React, TypeScript, CSS"
+        if any(
+            x in hid
+            for x in (
+                "BACKEND",
+                "SERVER",
+                "MICROSERVICE",
+                "-API",
+                "API-SERVICE",
+            )
+        ):
+            return "Rust"
+        return "Rust, Tauri, React, CSS"
+
+    @staticmethod
+    def _coalesce_hlig_language(hlig_node: dict) -> str:
+        norm = AgentRunner._normalize_planner_language(hlig_node.get("language"))
+        return norm if norm else AgentRunner._default_language_for_hlig(hlig_node)
+
+    @staticmethod
     def _enrich_dtg_nodes(dtg_out: dict, hlig_node: dict) -> dict:
         """
         Enrich each DTG node with parent_hlig and language so nodes are self-contained
@@ -136,21 +172,21 @@ class AgentRunner:
         """
         if not dtg_out or not isinstance(dtg_out, dict) or "nodes" not in dtg_out:
             return dtg_out
+        lang = AgentRunner._coalesce_hlig_language(hlig_node)
         parent_hlig = {
             "id": hlig_node.get("id", ""),
             "task": hlig_node.get("task"),
             "inputs": hlig_node.get("inputs", []),
             "outputs": hlig_node.get("outputs", []),
-            "language": hlig_node.get("language", "Rust, Tauri, React, CSS"),
+            "language": lang,
             "external_interfaces": hlig_node.get("external_interfaces", []),
         }
-        lang = hlig_node.get("language", "Rust, Tauri, React, CSS")
         for n in dtg_out["nodes"]:
             if isinstance(n, dict):
                 n["parent_hlig"] = parent_hlig
                 n["language"] = lang
                 tt = (n.get("task_type") or "").lower()
-                if tt in ("code", "integration", "test", "build", "verification"):
+                if tt in ("code", "integration", "test", "build", "verification", "scaffold"):
                     es = (n.get("expansion_strategy") or "").strip()
                     if not es or es not in EXPANSION_STRATEGIES:
                         n["expansion_strategy"] = default_expansion_strategy_for_node(parent_hlig, n)
@@ -160,6 +196,8 @@ class AgentRunner:
         """Traverse HLIG nodes, generate DTG for each, attach to node. Retries designer once on DTG cycle."""
         designer_config = (steps.get("designer") or {}).get("config") or {}
         for nid, data in list(hlig_graph.nodes()):
+            if (data.get("node_type") or "").lower() == "contract":
+                continue
             node_dict = {"id": nid, **{k: v for k, v in data.items() if k != "dtg" and not callable(v)}}
             node_dict.update(designer_config)  # Inject max_design_nodes, max_code_nodes for coarser DTG
             log_pipeline_event(ctx.session_id, "dtg_generation_started", {"hlig_node": nid})
@@ -209,7 +247,7 @@ class AgentRunner:
             prompt=spec.get("prompt"),
             config=spec.get("config", {}),
             multi_mcp=self._multi_mcp,
-            reads=["original_query", "user_clarification"],
+            reads=["original_query", "user_clarification", "prior_spec"],
             writes=["hlig"],
         )
         ctx = agent.run(ctx)
@@ -405,7 +443,11 @@ class AgentRunner:
                 existing_outputs = ctx.globals_schema.get("artifact_outputs_path")
                 if existing_outputs and Path(existing_outputs).exists():
                     outputs_path = gen.generate_code_only(
-                        ctx.hlig_graph, ctx.session_id, Path(existing_outputs), has_design_docs=has_design_docs
+                        ctx.hlig_graph,
+                        ctx.session_id,
+                        Path(existing_outputs),
+                        has_design_docs=has_design_docs,
+                        graph_state=ctx.graph_state,
                     )
                 else:
                     # No design docs pipeline (e.g. hlig_no_design_docs): create outputs dir, write interfaces, generate code only
@@ -416,7 +458,11 @@ class AgentRunner:
                     outputs_dir.mkdir(parents=True, exist_ok=True)
                     _write_interface_definitions(ctx.hlig_graph, outputs_dir)
                     outputs_path = gen.generate_code_only(
-                        ctx.hlig_graph, ctx.session_id, outputs_dir, has_design_docs=has_design_docs
+                        ctx.hlig_graph,
+                        ctx.session_id,
+                        outputs_dir,
+                        has_design_docs=has_design_docs,
+                        graph_state=ctx.graph_state,
                     )
                 if outputs_path:
                     ctx.globals_schema["artifact_outputs_path"] = str(outputs_path)
@@ -592,6 +638,21 @@ class AgentRunner:
                 continue
             if planner_out.get("hlig"):
                 try:
+                    from spec.spec_models import merge_planner_spec_with_hlig
+
+                    intent_text = str(ctx.globals_schema.get("original_query", "") or ctx.get_state("query", ""))
+                    spec_merged = merge_planner_spec_with_hlig(planner_out, intent_text)
+                    ctx.globals_schema["spec"] = spec_merged
+                    ctx.globals_schema["prior_spec"] = spec_merged
+                    ctx.graph_state.record_snapshot("spec_snapshot", spec_merged)
+                    hlig_block = planner_out.get("hlig") or {}
+                    contract_nodes = [
+                        n
+                        for n in (hlig_block.get("nodes") or [])
+                        if isinstance(n, dict) and (n.get("node_type") or "").lower() == "contract"
+                    ]
+                    ctx.graph_state.record_snapshot("contract_graph", {"nodes": contract_nodes})
+
                     hlig_graph = HLIGGraph.from_planner_hlig(planner_out)
                     removed_cycles = planner_out.pop("_hlig_cycle_edges_removed", None)
                     if removed_cycles:

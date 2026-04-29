@@ -3,13 +3,23 @@ Deterministic DTG → Implementation Graph (IG) expansion.
 
 IG tasks are not stored in the DTG; they are computed at execution time from
 `expansion_strategy`, `files_owned`, contracts, and tech_stack.
+
+Execution mapping (artifact generator; stop on failure when abort env is on):
+- **scaffold**: expand to paths, create empty files and dirs deterministically (no LLM).
+- **code** / legacy integration·verification: expand to one IG step per file; writer +
+  mechanical + deterministic on-disk checks + LLM review per step; bounded retries.
+- **review**: not run as a separate executor; expressed in the DTG only.
+- **test**: expand when files are owned; after a successful local build, run ``cargo test``
+  / ``npm test`` for test-typed nodes; if expansion is empty, run tests only.
+- **build**: if expansion is empty, run full local build as a checkpoint; otherwise
+  follows the code path and build after edits.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-# Initial allowed set (see prompts/dtg_generator.md).
+# Canonical strategies (templates keyed here). Aliases resolve to these (prompts / DTG may use either).
 EXPANSION_STRATEGIES = frozenset(
     {
         "frontend_app_standard",
@@ -20,16 +30,31 @@ EXPANSION_STRATEGIES = frozenset(
     }
 )
 
-_CODE_TASK_TYPES = frozenset({"code", "integration", "test", "build", "verification"})
+# Public alias names (PART 3) — deterministic mapping, no LLM.
+EXPANSION_STRATEGY_ALIASES: dict[str, str] = {
+    "frontend_standard": "frontend_app_standard",
+    "backend_standard": "backend_service_standard",
+    "db_schema_standard": "database_schema_standard",
+}
+
+EXPANSION_STRATEGIES_ALL_NAMES = EXPANSION_STRATEGIES | frozenset(EXPANSION_STRATEGY_ALIASES.keys())
+
+
+def canonical_expansion_strategy(name: str) -> str:
+    """Map user-facing / legacy alias to canonical template key."""
+    n = (name or "").strip()
+    return EXPANSION_STRATEGY_ALIASES.get(n, n)
 
 # Logical DTG roles (prompts/dtg_generator.md). Legacy graphs may omit `type` and use `task_type` only.
-DTG_LOGICAL_TYPES = frozenset({"design", "code", "test", "build", "contract"})
+DTG_LOGICAL_TYPES = frozenset(
+    {"design", "contract", "scaffold", "code", "review", "test", "build"}
+)
 
 
 def effective_dtg_type(node: dict) -> str:
     """
     Resolve logical type for validation and execution.
-    Prefer explicit `type`; else map legacy `task_type` to design|code|test|build|contract.
+    Prefer explicit `type`; else map legacy `task_type` to strict types.
     """
     raw = (node.get("type") or "").strip().lower()
     if raw in DTG_LOGICAL_TYPES:
@@ -37,8 +62,12 @@ def effective_dtg_type(node: dict) -> str:
     tt = (node.get("task_type") or "").strip().lower()
     if tt == "review":
         return "review"
+    if tt == "scaffold":
+        return "scaffold"
     if tt == "documentation":
         return "design"
+    if tt == "contract":
+        return "contract"
     if tt in ("integration", "verification"):
         return "code"
     if tt in DTG_LOGICAL_TYPES:
@@ -47,8 +76,13 @@ def effective_dtg_type(node: dict) -> str:
 
 
 def is_design_like_node(node: dict) -> bool:
-    """Design, documentation, review, or contract — specs/interfaces, not IG file expansion."""
+    """Design or contract — specs/interfaces / API artifacts, not scaffold or code execution."""
     return effective_dtg_type(node) in ("design", "contract")
+
+
+def is_scaffold_node(node: dict) -> bool:
+    """Scaffold nodes create project layout and empty files (deterministic), no LLM codegen."""
+    return effective_dtg_type(node) == "scaffold"
 
 
 def is_code_execution_node(node: dict) -> bool:
@@ -57,8 +91,8 @@ def is_code_execution_node(node: dict) -> bool:
 
 
 def needs_expansion_strategy(node: dict) -> bool:
-    """True when the node must declare a valid expansion_strategy (implementation work)."""
-    return effective_dtg_type(node) in ("code", "test", "build")
+    """True when the node must declare a valid expansion_strategy (implementation / scaffold work)."""
+    return effective_dtg_type(node) in ("code", "test", "build", "scaffold")
 
 # Template paths per strategy (concrete files; deterministic order).
 _TEMPLATES: dict[str, list[str]] = {
@@ -147,13 +181,14 @@ def default_expansion_strategy_for_node(hlig_node: dict, dtg_node: dict) -> str:
 
 
 def normalize_expansion_strategy(dtg_node: dict) -> str:
-    raw = (dtg_node.get("expansion_strategy") or "").strip()
+    raw = canonical_expansion_strategy(dtg_node.get("expansion_strategy") or "")
     if raw in EXPANSION_STRATEGIES:
         return raw
     parent = dtg_node.get("parent_hlig")
     ph = parent if isinstance(parent, dict) else {}
     fallback = default_expansion_strategy_for_node(ph, dtg_node)
-    return fallback if fallback in EXPANSION_STRATEGIES else "integration_standard"
+    fb = canonical_expansion_strategy(fallback)
+    return fb if fb in EXPANSION_STRATEGIES else "integration_standard"
 
 
 def expand_dtg_node(
@@ -181,7 +216,7 @@ def expand_dtg_node(
     fo = dtg_node.get("files_owned")
     has_owned_files = isinstance(fo, list) and any(isinstance(p, str) and p.strip() for p in fo)
     # Build checkpoints are logical; do not synthesize template files when none are owned.
-    if (tt == "build" or et == "build") and not has_owned_files:
+    if et != "scaffold" and (tt == "build" or et == "build") and not has_owned_files:
         return []
 
     paths = _resolve_file_paths(dtg_node, strategy, framework)

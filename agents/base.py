@@ -85,6 +85,15 @@ class BaseAgent:
             block_content = query
             if clarification:
                 block_content = f"{query}\n\n[User's clarification responses:]\n{clarification}"
+            prior_spec = input_data.get("prior_spec")
+            if prior_spec is not None:
+                try:
+                    spec_txt = json.dumps(prior_spec, indent=2, default=str)
+                except TypeError:
+                    spec_txt = str(prior_spec)
+                block_content = (
+                    f"{block_content}\n\n[Prior SPEC (refine in place; keep HLIG consistent with this):]\n{spec_txt}"
+                )
             full_prompt = re.sub(
                 r"<USER_PROJECT_REQUEST>.*?</USER_PROJECT_REQUEST>",
                 f"<USER_PROJECT_REQUEST>\n{block_content}\n</USER_PROJECT_REQUEST>",

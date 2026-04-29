@@ -8,12 +8,16 @@ Supports:
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
+from core.contract_graph import validate_hlig_contract_nodes, validate_spec_modules_contracts
+from core.dtg_task_split import files_owned_max
 from core.expansion_engine import (
     DTG_LOGICAL_TYPES,
     EXPANSION_STRATEGIES,
+    canonical_expansion_strategy,
     effective_dtg_type,
     needs_expansion_strategy,
 )
@@ -26,7 +30,7 @@ except ImportError:
 
 # --- Spec constants (from language_readme.md) ---------------------------------
 
-HLIG_ID_PATTERN = re.compile(r"^HLIG-\d+$")
+HLIG_ID_PATTERN = re.compile(r"^HLIG-[A-Za-z0-9_-]+$")
 DTG_ID_PATTERN = re.compile(r"^DTG-(\d+)-\d+$")
 
 HLIG_REQUIRED_NODE = {"id", "task", "inputs", "outputs"}
@@ -56,16 +60,17 @@ DTG_OPTIONAL_NODE = {
 }
 DTG_TASK_TYPES = {
     "design",
+    "contract",
+    "scaffold",
     "code",
+    "review",
     "test",
     "integration",
     "documentation",
     "verification",
     "build",
-    "review",
-    "contract",
 }
-DTG_NODE_TYPES = {"reasoning", "design", "coding", "evaluation", "tool"}
+DTG_NODE_TYPES = {"reasoning", "design", "coding", "evaluation", "tool", "contract"}
 EDGE_TYPES = {"control", "data"}
 DEPENDENCY_TYPES = {"strict", "soft", "data-flow"}
 
@@ -130,10 +135,25 @@ def validate_hlig(data: dict, strict_canonical_names: bool = False) -> list[str]
             errs.append(f"HLIG node at index {i} missing 'id'")
             continue
         if not HLIG_ID_PATTERN.match(nid):
-            errs.append(f"HLIG node id '{nid}' does not match pattern HLIG-{{N}}")
+            errs.append(f"HLIG node id '{nid}' does not match pattern HLIG-<alphanumeric>")
         if nid in node_ids:
             errs.append(f"Duplicate HLIG node id '{nid}'")
         node_ids.add(nid)
+
+        if (n.get("node_type") or "").lower() == "contract":
+            c_missing = []
+            for fld in ("name", "producer", "version"):
+                if not n.get(fld):
+                    c_missing.append(fld)
+            if not isinstance(n.get("consumers"), list) or not n.get("consumers"):
+                c_missing.append("consumers")
+            if "schema" not in n or not isinstance(n.get("schema"), dict):
+                c_missing.append("schema")
+            if c_missing:
+                errs.append(
+                    f"HLIG contract node '{nid}' missing or invalid fields: {sorted(set(c_missing))}"
+                )
+            continue
 
         missing = HLIG_REQUIRED_NODE - set(n.keys())
         if missing:
@@ -178,6 +198,8 @@ def validate_hlig(data: dict, strict_canonical_names: bool = False) -> list[str]
 
     errs.extend(_check_acyclic(nodes, edges, "id"))
 
+    errs.extend(validate_hlig_contract_nodes(nodes, edges))
+
     return errs
 
 
@@ -198,10 +220,31 @@ def contract_first_warnings(nodes: list[dict]) -> list[str]:
         dep_nodes = [by_id[d] for d in deps if d in by_id]
         if len(dep_nodes) != len(deps):
             continue
-        if dep_nodes and all(effective_dtg_type(dn) == "code" for dn in dep_nodes):
+        impl_only = {"code", "scaffold"}
+        if dep_nodes and all(effective_dtg_type(dn) in impl_only for dn in dep_nodes):
             warns.append(
-                f"DTG node '{nid}': code node depends only on other code nodes; "
-                "prefer a contract or design node between modules (contract-first)."
+                f"DTG node '{nid}': code node depends only on code/scaffold nodes; "
+                "prefer a contract or design node between modules (if applicable — contract-first)."
+            )
+    return warns
+
+
+def files_owned_policy_warnings(nodes: list[dict]) -> list[str]:
+    """Soft policy: prefer bounded files_owned on code nodes (PART 5)."""
+    warns: list[str] = []
+    cap = files_owned_max()
+    for n in nodes:
+        nid = n.get("id", "?")
+        if effective_dtg_type(n) != "code":
+            continue
+        fo = n.get("files_owned")
+        if not isinstance(fo, list):
+            continue
+        nfiles = len([p for p in fo if isinstance(p, str) and p.strip()])
+        if nfiles > cap:
+            warns.append(
+                f"DTG node '{nid}': files_owned has {nfiles} files (recommended max {cap}; "
+                f"see core.dtg_task_split.split_large_task)"
             )
     return warns
 
@@ -271,12 +314,28 @@ def validate_dtg(dtg: dict, hlig_node_id: str | None = None) -> list[str]:
             if not es or not isinstance(es, str) or not es.strip():
                 errs.append(
                     f"DTG node '{nid}': expansion_strategy is required for logical type "
-                    f"'{effective_dtg_type(n)}' (code/test/build)"
+                    f"'{effective_dtg_type(n)}' (code/test/build/scaffold)"
                 )
-            elif es.strip() not in EXPANSION_STRATEGIES:
+            elif canonical_expansion_strategy(es.strip()) not in EXPANSION_STRATEGIES:
                 errs.append(
-                    f"DTG node '{nid}': expansion_strategy '{es}' not in {sorted(EXPANSION_STRATEGIES)}"
+                    f"DTG node '{nid}': expansion_strategy '{es}' not in "
+                    f"{sorted(EXPANSION_STRATEGIES)} (aliases allowed: frontend_standard, backend_standard, db_schema_standard)"
                 )
+
+        if effective_dtg_type(n) == "code":
+            fo = n.get("files_owned")
+            if isinstance(fo, list):
+                nfiles = len([p for p in fo if isinstance(p, str) and p.strip()])
+                cap = files_owned_max()
+                if nfiles > cap and os.environ.get("STRICT_DTG_FILE_COUNT", "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    errs.append(
+                        f"DTG node '{nid}': files_owned has {nfiles} paths; "
+                        f"policy max is {cap} (split with core.dtg_task_split.split_large_task)"
+                    )
 
         out = n.get("outputs_produced")
         if isinstance(out, list):
@@ -385,6 +444,21 @@ def validate_graph(data: dict, strict_canonical_names: bool = False) -> dict[str
                 result["warnings"].append(prefix + w)
             for w in section_warnings(dnodes):
                 result["warnings"].append(prefix + w)
+            for w in files_owned_policy_warnings(dnodes):
+                result["warnings"].append(prefix + w)
+
+    spec = data.get("spec")
+    node_ids_set = {str(n.get("id")) for n in (nodes or []) if isinstance(n, dict) and n.get("id")}
+    if isinstance(spec, dict):
+        try:
+            from spec.spec_models import validate_spec
+
+            for e in validate_spec(spec):
+                result["warnings"].append(f"SPEC validation: {e}")
+        except ImportError:
+            pass
+        for e in validate_spec_modules_contracts(spec, node_ids_set):
+            result["warnings"].append(f"SPEC/HLIG alignment: {e}")
 
     return result
 

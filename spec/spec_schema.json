@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://plainspeak.local/spec/v1",
+  "title": "PlainSpeak Project SPEC",
+  "type": "object",
+  "required": ["intent", "modules", "contracts", "features", "constraints"],
+  "additionalProperties": true,
+  "properties": {
+    "intent": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Authoritative, resolved intent (no unresolved ambiguity)."
+    },
+    "modules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "description"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string" },
+          "description": { "type": "string" },
+          "role": { "type": "string" }
+        }
+      }
+    },
+    "contracts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "producer", "consumers", "schema", "version"],
+        "additionalProperties": true,
+        "properties": {
+          "name": { "type": "string" },
+          "producer": { "type": "string" },
+          "consumers": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "schema": { "type": "object" },
+          "version": { "type": "string" }
+        }
+      }
+    },
+    "features": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

@@ -77,13 +77,19 @@ Rules for questions:
 
 ## 🟩 WHEN REQUIREMENTS ARE FULLY CLEAR
 
-When **no clarifications are needed**, produce the final HLIG.
+When **no clarifications are needed**, you MUST first freeze a **SPEC** (structured, unambiguous intent), then derive the **HLIG** from that SPEC only (do not invent new requirements when building HLIG nodes).
+
+### SPEC step (mandatory)
+
+1. **SPEC** is complete when: modules, contracts, features, and constraints are fully determined from the user request (no open questions).
+2. **Validate mentally** before emitting JSON: every subsystem in `hlig.nodes` must map to a `spec.modules[]` entry; every cross-subsystem API must appear in `spec.contracts[]` and be reflected in HLIG (contract nodes and/or edges).
+3. If a `[Prior SPEC …]` block appears in the user request, **refine that SPEC** and emit an updated `spec` + consistent `hlig`.
 
 ---
 
-# 📘 HLIG OUTPUT FORMAT (STRICT JSON)
+# 📘 OUTPUT FORMAT (STRICT JSON)
 
-Return the HLIG using the exact structure below:
+Return **both** `spec` and `hlig` using the structure below:
 
 ```json
 {
@@ -92,6 +98,24 @@ Return the HLIG using the exact structure below:
     "name": "<project name>",
     "description": "<one-paragraph high-level description>"
   },
+  "spec": {
+    "intent": "<single authoritative paragraph: what the system does, no ambiguity>",
+    "modules": [
+      { "id": "HLIG-BACKEND", "description": "<subsystem scope>", "role": "backend" },
+      { "id": "HLIG-FRONTEND", "description": "<subsystem scope>", "role": "frontend" }
+    ],
+    "contracts": [
+      {
+        "name": "ContentAPI",
+        "producer": "HLIG-BACKEND",
+        "consumers": ["HLIG-FRONTEND"],
+        "schema": { "type": "api", "endpoints": [] },
+        "version": "v1"
+      }
+    ],
+    "features": ["<feature 1>", "<feature 2>"],
+    "constraints": { "stack": "…", "compliance": "…" }
+  },
   "hlig": {
     "nodes": [
       {
@@ -99,21 +123,43 @@ Return the HLIG using the exact structure below:
         "task": "<high-level subsystem task>",
         "inputs": ["<inputs>"],
         "outputs": ["<outputs>"],
-        "language": "<preferred language; default: 'Rust, Tauri, React, CSS'>",
+        "language": "<PRIMARY stack for THIS subsystem only — not the whole project>",
         "external_interfaces": ["API", "DB", "Filesystem", "Auth", "None"],
         "dtg_root": "DTG-1"
+      },
+      {
+        "id": "HLIG-CONTRACT-1",
+        "node_type": "contract",
+        "name": "ContentAPI",
+        "producer": "HLIG-BACKEND",
+        "consumers": ["HLIG-FRONTEND"],
+        "schema": {
+          "type": "api",
+          "description": "Shared contract",
+          "endpoints": [{"method": "GET", "path": "/api/health", "response": {}}]
+        },
+        "version": "v1",
+        "task": "Contract: Content API",
+        "inputs": [],
+        "outputs": []
       }
     ],
     "edges": [
       {
-        "from": "HLIG-X",
-        "to": "HLIG-Y",
-        "interface_type": "<API | DB | message | dependency>",
+        "from": "HLIG-BACKEND",
+        "to": "HLIG-CONTRACT-1",
+        "interface_type": "dependency",
+        "causal": true
+      },
+      {
+        "from": "HLIG-CONTRACT-1",
+        "to": "HLIG-FRONTEND",
+        "interface_type": "API",
         "causal": true,
         "interface_spec": {
-          "type": "api | database | message | file",
-          "description": "Human-readable description of the interface",
-          "endpoints": [{"method": "GET", "path": "/path", "request": {}, "response": {}}],
+          "type": "api",
+          "description": "Same as contract HLIG-CONTRACT-1",
+          "endpoints": [{"method": "GET", "path": "/api/health", "response": {}}],
           "schema": {}
         }
       }
@@ -122,11 +168,16 @@ Return the HLIG using the exact structure below:
 }
 ```
 
+**Contract nodes (HLIG):** Prefer routing integrations through **`node_type": "contract"`** nodes (`name`, `producer`, `consumers`, `schema`, `version`) so consumers and producers share one definition. You may still attach `interface_spec` on edges for backward compatibility. Flow: **producer module → contract node → consumer module**.
+
 Rules:
 - The output must be valid JSON.
 - No additional commentary or explanation.
 - You must NOT generate code.
-- Always include at least one HLIG node.
+- Always include **`spec`** and at least one **implementation** HLIG node (contract-only graphs are invalid).
+- **`spec` must be internally consistent** with `hlig` (module ids, contract producers/consumers).
+- **`language` is per-node:** set it to what **this** HLIG primarily implements. Examples: API/static server HLIG → `Rust` or `Node.js, Express` (not `React, CSS` alone unless this node is only the SPA). Website/UI HLIG → `React, TypeScript, CSS` (do not put `Rust` here unless this same node owns a Tauri desktop shell). Omitting `language` is discouraged; the runner will guess from the node `id` (see below).
+- **Stable HLIG `id` tokens:** Prefer suffixes the toolchain recognizes — `HLIG-…-BACKEND` / `HLIG-…-FRONTEND` (or `…-SERVER`, `…-API` for services). That pins scaffolding: backend-shaped IDs get a Rust `Cargo.toml` unless you explicitly name a Node server in `language` (Express, Fastify, etc.); `FRONTEND` / `WEB-CLIENT` / `SPA-UI` in the id pins the Vite/React project.
 - **HLIG edges must form a DAG (directed acyclic graph):** never create a cycle (e.g. do not add both `HLIG-A → HLIG-B` and `HLIG-B → HLIG-A`). Use **one** directed edge per dependency. Typical pattern: **backend → frontend** when the frontend consumes an API the backend provides (the edge carries `interface_spec`). Do not add a reverse edge unless it is a distinct, non-cyclic contract—and in practice one edge per pair of subsystems is enough.
 - `dtg_root` is a unique ID pointing to the root of the corresponding DTG.
 - **Canonical artifact names:** For each HLIG node, prefer `inputs` and `outputs` as **canonical names** (snake_case identifiers, e.g. `http_requests`, `web_content`, `order_api_spec`) so that DTG nodes can reference them exactly for deterministic dependency matching.

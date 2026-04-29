@@ -325,7 +325,7 @@ A **DTG** is a directed acyclic graph that decomposes a single HLIG node into **
 | `title` | string | Yes | Short descriptive subtask name |
 | `description` | string | Yes | Detailed, deterministic explanation of the subtask |
 | `task_type` | string | Yes | One of the enumerated task types (see below) |
-| `node_type` | string | No | **Node classification**: `reasoning` \| `design` \| `coding` \| `evaluation` \| `tool`. When omitted, implementations MAY infer from `task_type` (e.g. design/documentation → design; code/build/integration/verification → coding; test → evaluation). Used for visualization and policy. |
+| `node_type` | string | No | **Node classification**: `reasoning` \| `design` \| `coding` \| `evaluation` \| `tool`. When omitted, implementations MAY infer from `task_type` (e.g. design/documentation/contract → design; scaffold/code/build/integration/verification → coding; test → evaluation). Used for visualization and policy. |
 | `inputs_required` | array of string | Yes | **Canonical artifact names** this node requires. Each entry MUST exactly match an `outputs_produced` name from a node listed in `dependencies`. Use snake_case identifiers (e.g. `architecture_spec`, `api_handlers`). Enables deterministic dependency resolution and validation. |
 | `outputs_produced` | array of string | Yes | **Canonical artifact names** this node produces. Use exact, referrable names (snake_case) so that downstream nodes can list them in `inputs_required`. SHOULD align with or refine parent HLIG `outputs` where applicable. |
 | `output_descriptions` | object | No | Optional map from artifact name (key) to short human-readable description (value). Used for prompts and docs; dependency matching uses the names in `outputs_produced` only. |
@@ -350,13 +350,15 @@ A **DTG** is a directed acyclic graph that decomposes a single HLIG node into **
 | Value | Meaning |
 |-------|---------|
 | `design` | Architectural or design documentation |
+| `contract` | API/schema artifacts (OpenAPI, JSON Schema); no implementation code |
+| `scaffold` | Project layout, empty files, config shells (deterministic; before code) |
 | `code` | Implementation of code module(s) |
 | `test` | Unit or integration tests |
-| `integration` | Wiring components together |
+| `integration` | Wiring components together (legacy; often treated as `code` at runtime) |
 | `documentation` | User or developer documentation |
-| `verification` | Validation or quality checks |
+| `verification` | Validation or quality checks (legacy; often treated as `code` at runtime) |
 | `build` | Build, packaging, or deployment configuration |
-| `review` | Code or design review |
+| `review` | Review intent in graph; paired with code steps in the execution engine |
 
 #### 4.4.1 Execution Spec (Optional)
 
@@ -636,8 +638,9 @@ from, to, edge_type, interface_type, causal, interface_spec, interface_ref
 
 ### DTG Node Fields
 ```
-id, title, description, task_type, node_type, inputs_required, outputs_produced,
-output_descriptions, dependencies, success_criteria, execution_spec, parent_hlig, language
+id, title, description, task_type, node_type, type (optional logical mirror of task_type),
+inputs_required, outputs_produced, output_descriptions, dependencies, success_criteria,
+files_owned, expansion_strategy, section, execution_spec, parent_hlig, language
 ```
 (Canonical names: `inputs_required` and `outputs_produced` use exact snake_case identifiers; `output_descriptions` maps name → human description.)
 
@@ -652,7 +655,7 @@ from, to, edge_type, dependency_type, description, data_spec
 - **interface_spec.type**: api, database, message, file
 - **edge_type** (HLIG/DTG): control, data
 - **node_type** (DTG): reasoning, design, coding, evaluation, tool
-- **task_type**: design, code, test, integration, documentation, verification, build, review
+- **task_type**: design, contract, scaffold, code, review, test, integration, documentation, verification, build
 - **dependency_type**: strict, soft, data-flow
 
 ---
@@ -757,7 +760,7 @@ For DTG validation:
           "id": { "type": "string", "pattern": "^DTG-[0-9]+-[0-9]+$" },
           "title": { "type": "string" },
           "description": { "type": "string" },
-          "task_type": { "enum": ["design", "code", "test", "integration", "documentation", "verification", "build", "review"] },
+          "task_type": { "enum": ["design", "contract", "scaffold", "code", "review", "test", "integration", "documentation", "verification", "build"] },
           "node_type": { "type": "string", "enum": ["reasoning", "design", "coding", "evaluation", "tool"] },
           "inputs_required": { "type": "array", "items": { "type": "string" }, "description": "Canonical artifact names; must match outputs_produced of dependency nodes" },
           "outputs_produced": { "type": "array", "items": { "type": "string" }, "description": "Canonical artifact names (snake_case)" },

@@ -58,6 +58,174 @@ Your entire response must be exactly this JSON object (no other text before or a
 
 ---
 
+## ARTIFACT-CENTRIC MODEL
+
+Every node MUST declare artifacts explicitly:
+
+* **`inputs_required`**: list of **artifact_ids** (canonical names) this node reads.
+* **`outputs_produced`**: list of **artifact_ids** this node writes.
+
+Rules:
+
+1. No node may depend on an artifact it did not receive through **`inputs_required`** matching a dependency’s **`outputs_produced`** (see dependency rules below).
+2. No node may claim **`outputs_produced`** that another node also produces (single owner per artifact).
+3. Each artifact_id has exactly **one** owning node.
+
+Treat artifacts as the only legal data interface between nodes.
+
+---
+
+## NODE TYPES (STRICT)
+
+Allowed **`task_type`** values (and optional mirror **`type`** with the same name):
+
+| `task_type` | Role |
+|-------------|------|
+| **`design`** | Structure, file list, architecture; design specs |
+| **`contract`** | API/schema artifacts (OpenAPI, JSON Schema); no implementation code |
+| **`scaffold`** | Project layout, **empty** files, config shells (**mandatory** before code) |
+| **`code`** | Generates **exactly one file** per runtime IG step (see CODE NODE RULES) |
+| **`review`** | Paired with code in the execution engine (**not** a separate standalone codegen step) |
+| **`test`** | Validates behavior (tests); may own test files; engine runs test suite when applicable |
+| **`build`** | Full compile/build checkpoint |
+
+**Legacy mapping (for older graphs only):** `documentation` → `design`; `integration` / `verification` → treated like `code` at runtime.
+
+Do **not** mix responsibilities in one node (e.g. no “design + code” in a single node).
+
+---
+
+## CONTRACT-FIRST MODEL
+
+All cross-cutting dependencies between frontend and backend MUST go through **contract** artifacts.
+
+Rules:
+
+1. **Never** connect a frontend **code** node directly to a backend **code** node in the data-flow sense without a **contract** node in between.
+2. Always insert a **contract** node that produces a concrete artifact (e.g. `user_api.json`, OpenAPI).
+3. Backend and frontend **code** nodes consume that **same** contract artifact in **`inputs_required`**.
+4. **Contract** nodes MUST appear **before** any dependent **code** nodes in the topological order.
+
+Example:
+
+1. `[Define User API Contract]` → `outputs_produced`: [`user_api_spec`]
+2. `[Code Backend User Service]` → `inputs_required`: [`user_api_spec`]
+3. `[Code Frontend User Client]` → `inputs_required`: [`user_api_spec`]
+
+---
+
+## SUBPROBLEM DEFINITION
+
+Each HLIG must be split into **subproblems**. Each subproblem:
+
+* Represents **one** feature, component, or API surface
+* Is **independently implementable** behind declared artifacts
+* Maps to a **small, named** set of files (declared in **`files_owned`** and/or scaffold)
+
+Examples: “Menu Page”, “User API”, “Auth Service”.
+
+---
+
+## EXECUTION FLOW PER SUBPROBLEM
+
+For each subproblem, the DTG MUST encode this **logical** sequence:
+
+1. **Design** node → file list, structure, required contracts
+2. **Contract** node(s) → API/schema artifacts
+3. **Scaffold** node (**mandatory**) → directories, empty files, config
+4. **Code** node(s) → one IG step per file
+5. **Review** → enforced **inside** the code execution loop (deterministic checks + LLM review per file)
+6. **Test** node(s) → behavior validation / test execution
+
+---
+
+## CODE NODE RULES (CRITICAL)
+
+Each **code** node at runtime expands to IG steps where **each** step:
+
+* Targets **exactly one** primary file
+* Uses only **`inputs_required`** and declared contracts/templates
+* Must not modify files outside that step’s target
+
+Forbidden: multi-file dumps in one step, implicit dependencies, “rewrite entire project” instructions.
+
+---
+
+## REVIEW NODE RULES (MANDATORY)
+
+Every **code** IG step follows:
+
+**A. Deterministic validation (required)** — syntax/parsing, imports where checkable, toolchain gates (tsc/eslint/cargo as configured), contract file presence when refs are concrete.
+
+**B. LLM-based review** — semantic correctness, design adherence, quality.
+
+If **any** check fails: **retry** codegen for that file; the pipeline **must not** treat the step as complete until it passes or retries are exhausted.
+
+Standalone **`task_type: review`** nodes **do not** run a separate writer in the engine; they express intent in the graph only—actual review is **always** coupled to code steps.
+
+---
+
+## STRICT RETRY LOOP (CRITICAL)
+
+Execution for each **code** file uses a bounded retry budget (default **3** inner iterations per file, env-tunable; outer per-node build retries remain separate).
+
+Pseudocode:
+
+```
+MAX_RETRIES = 3  # IG_CODE_STEP_MAX_ITERATIONS
+
+FOR each code IG step:
+    attempt = 0
+    WHILE attempt < MAX_RETRIES:
+        run writer → single file
+        run deterministic validators
+        IF deterministic fails:
+            attempt += 1
+            CONTINUE
+        run LLM reviewer
+        IF reviewer passes:
+            commit file
+            BREAK
+        ELSE:
+            attempt += 1
+    IF all attempts fail:
+        FAIL pipeline (when abort-on-failure is enabled)
+```
+
+---
+
+## SCAFFOLD NODE (MANDATORY)
+
+A **scaffold** node MUST:
+
+* Create **directory structure**
+* Create **all** required **empty** source/config paths listed in **`files_owned`** (or strategy template)
+* Declare **`expansion_strategy`** like other executable nodes
+
+**Code** nodes MUST NOT invent new paths outside what scaffold (plus explicit **`files_owned`** for that code node) allows.
+
+---
+
+## DEPENDENCY RULES
+
+* The DTG must be a **DAG** (acyclic)
+* Dependencies are explicit in **`dependencies`** and **`edges`**
+* No circular dependencies
+* No implicit “hidden” dependencies—everything flows through artifact names
+
+---
+
+## BUILD VALIDATION
+
+**Build** nodes MUST:
+
+* Depend on all implementation artifacts they gate
+* Trigger (or document) a **full** compile/build in the execution engine
+
+Fail fast on errors; no silent continuation when abort flags are on.
+
+---
+
 ## DTG NODE SCHEMA
 
 Each node in `nodes` must follow:
@@ -67,7 +235,7 @@ Each node in `nodes` must follow:
   "id": "DTG-X-Y",
   "title": "Short descriptive subtask name",
   "description": "Detailed, deterministic explanation of the subtask.",
-  "task_type": "design | code | test | integration | documentation | verification | build | review",
+  "task_type": "design | contract | scaffold | code | review | test | build",
   "node_type": "reasoning | design | coding | evaluation | tool",
   "inputs_required": ["canonical_artifact_name_from_dependency"],
   "outputs_produced": ["canonical_artifact_name"],
@@ -80,17 +248,17 @@ Each node in `nodes` must follow:
 ```
 
 - `id`: Must be unique within the DTG. Use prefix from parent HLIG (e.g. `DTG-1-1`, `DTG-1-2`).
-- `task_type`: Exactly one of: design, code, test, integration, documentation, verification, build, review.
+- `task_type`: Strict set: **design, contract, scaffold, code, review, test, build** (plus legacy **integration, documentation, verification** where noted in NODE TYPES).
 - **`inputs_required`**: **Canonical artifact names only.** Each entry MUST exactly match an `outputs_produced` name from one of the nodes in `dependencies`. Use snake_case (e.g. `architecture_spec`, `api_handlers`). No free-form descriptions here—use `output_descriptions` on the producer node for human-readable text.
 - **`outputs_produced`**: **Canonical artifact names only.** Exact, referrable identifiers in snake_case (e.g. `architecture_spec`, `file_reader_module`). Downstream nodes will reference these exact names in their `inputs_required`. SHOULD align with or refine parent HLIG `outputs` where applicable.
 - **`output_descriptions`** (optional): Map from each artifact name in `outputs_produced` to a short human-readable description. Used for prompts and docs; dependency matching uses the names only.
-- **`files_owned`** (optional, for coding nodes only): When `task_type` is `"code"`, list the file paths (relative to project root) that this node creates or modifies. Each path must appear in exactly one node's `files_owned`. Omit or use `[]` for non-coding nodes.
-- **`expansion_strategy`** (**required** for every node whose `task_type` is `code`, `integration`, `test`, `build`, or `verification`): A string that selects how the execution engine expands this node at runtime into file-level Implementation Graph (IG) tasks. Must be one of the allowed values in **EXPANSION STRATEGY** below. Do not embed IG nodes in the DTG—only set this field.
+- **`files_owned`**: For **`scaffold`** and **`code`** (and **`test`** when it owns test files), list paths relative to project root. Each path appears in **exactly one** node. **Scaffold** = empty shells; **code** = files filled by IG steps.
+- **`expansion_strategy`** (**required** for **`scaffold`**, **`code`**, **`test`**, **`build`**, and legacy **`integration` / `verification`**): Deterministic IG expansion; must be one of **EXPANSION STRATEGY** values below.
 - `dependencies`: IDs of DTG nodes that must complete before this one.
 - `node_type`: High-level classification:
-  - `design` for architectural or documentation tasks (typically when `task_type` is design/documentation)
-  - `coding` for implementation/build/integration tasks (when `task_type` is code/build/integration/verification)
-  - `evaluation` for tests and validation (`task_type` test/integration/verification)
+  - `design` for architectural or documentation tasks (typically when `task_type` is design/documentation/**contract**)
+  - `coding` for implementation/build/scaffold tasks (when `task_type` is **scaffold**/code/build/integration/verification)
+  - `evaluation` for tests and validation (`task_type` test; some graphs use integration/verification for tests)
   - `tool` for pure tool-execution nodes (MCP tools, scripts)
   - `reasoning` only when the node is pure analysis/planning without producing design or code artifacts
 
@@ -105,7 +273,7 @@ Use these when passing a DTG node to an LLM for design docs or code generation.
 
 ## EXPANSION STRATEGY (CRITICAL)
 
-Each DTG node that performs implementation work (`task_type` among `code`, `integration`, `test`, `build`, `verification`) **must** define an `expansion_strategy`.
+Each DTG node that performs implementation or layout work (`task_type` among `scaffold`, `code`, `integration`, `test`, `build`, `verification`) **must** define an `expansion_strategy`.
 
 This determines how the node will be expanded **at runtime** into fine-grained implementation steps (the **Implementation Graph**, IG). The expansion must be **deterministic** (no free-form LLM decomposition of the graph itself).
 
@@ -117,11 +285,13 @@ Example:
 
 **Allowed values** (initial set):
 
-* `frontend_app_standard`
-* `backend_service_standard`
+* `frontend_app_standard` (alias: **`frontend_standard`**)
+* `backend_service_standard` (alias: **`backend_standard`**)
 * `crud_api_standard`
-* `database_schema_standard`
+* `database_schema_standard` (alias: **`db_schema_standard`**)
 * `integration_standard`
+
+**Task granularity:** For **`task_type": "code"`**, prefer **1–3 `files_owned` paths** per node. If more files are needed, split into additional code nodes (see `core.dtg_task_split.split_large_task`). The validator may warn when counts exceed the configured max.
 
 **Rules:**
 
@@ -145,7 +315,7 @@ Rules:
 4. The project entrypoint (e.g., main.rs, app.tsx, index.tsx) must be created by a single dedicated node.
 5. For React + Vite frontends, entry and page files that contain JSX must use `.jsx` or `.tsx` in `files_owned` paths (not `.js` for JSX).
 
-Add this optional field to the DTG node schema when task_type = "code":
+Declare **`files_owned`** for **`scaffold`** and **`code`** nodes (and **`test`** when it owns test files), for example:
 
 "files_owned": [
   "src/module/file.rs",

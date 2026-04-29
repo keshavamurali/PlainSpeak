@@ -19,8 +19,16 @@ from core.codegen_context import (
     extract_public_surface,
     load_shared_interfaces_excerpt,
 )
-from core.expansion_engine import expand_dtg_node, is_code_execution_node, is_design_like_node
+from core.deterministic_file_validator import validate_file as deterministic_validate_file
+from core.expansion_engine import (
+    effective_dtg_type,
+    expand_dtg_node,
+    is_code_execution_node,
+    is_design_like_node,
+    is_scaffold_node,
+)
 from core.hlig_dtg_graphs import HLIGGraph, DTGGraph
+from core.markov_context import validate_node_dependency_context
 from core.mechanical_code_validator import (
     extra_toolchain_validate,
     run_incremental_cargo_check,
@@ -39,6 +47,7 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 IG_EXECUTION_LOG = "ig_execution_log.jsonl"
+NODE_EXECUTION_LOG = "node_execution_log.jsonl"
 
 
 class LocalBuildFailedError(RuntimeError):
@@ -68,12 +77,12 @@ def _per_node_build_max_retries() -> int:
 
 
 def _ig_code_step_max_iterations() -> int:
-    """Max generate→review→mechanical iterations per IG file (and legacy mechanical retries scale)."""
-    raw = os.environ.get("IG_CODE_STEP_MAX_ITERATIONS", "6").strip()
+    """Max generate→review→mechanical iterations per IG file (default 3 = strict retry budget)."""
+    raw = os.environ.get("IG_CODE_STEP_MAX_ITERATIONS", "3").strip()
     try:
         return max(1, int(raw))
     except ValueError:
-        return 6
+        return 3
 
 
 def _ig_two_phase_enabled() -> bool:
@@ -107,6 +116,53 @@ def _append_ig_execution_log(hlig_dir: Path, record: dict) -> None:
             f.write(json.dumps(record, default=str) + "\n")
     except OSError:
         pass
+
+
+def _append_node_execution_log(hlig_dir: Path, record: dict[str, Any]) -> None:
+    """Structured per-DTG-node execution record (deterministic logging)."""
+    fp = hlig_dir / NODE_EXECUTION_LOG
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        with fp.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except OSError:
+        pass
+
+
+def _deterministic_on_disk_validate_enabled() -> bool:
+    return _env_truthy("ENABLE_DETERMINISTIC_FILE_VALIDATE", "1")
+
+
+def _maybe_validate_project_layout(
+    hlig_dir: Path,
+    dtg: DTGGraph,
+    framework: str,
+    *,
+    session_id: str,
+    hlig_id: str,
+) -> None:
+    """After codegen, check files_owned vs disk and naming rules. Raises when abort env is on."""
+    from core.project_layout_validator import layout_validation_enabled, validate_project_layout
+
+    if not layout_validation_enabled():
+        return
+    ok, errs = validate_project_layout(hlig_dir, dtg, framework)
+    if ok:
+        log_pipeline_event(session_id, "project_layout_ok", {"hlig": hlig_id})
+        return
+    msg = "\n".join(errs[:40])
+    log_pipeline_event(
+        session_id,
+        "project_layout_failed",
+        {"hlig": hlig_id, "error_count": len(errs), "sample": errs[:15]},
+    )
+    if _abort_on_local_build_failure():
+        raise LocalBuildFailedError(
+            f"Project layout validation failed for HLIG {hlig_id}:\n{msg}",
+            hlig_id=hlig_id,
+            dtg_node_id="__project_layout__",
+            stderr=msg[:8000],
+        )
 
 
 def _parse_code_reviewer_status(raw: str) -> str:
@@ -387,7 +443,50 @@ def _dependency_rules_text(framework: str, matrix: dict) -> str:
     if deps and isinstance(deps, dict):
         lines.append("Use these dependency versions (or compatible); do not invent versions or features:")
         lines.append(json.dumps(deps, indent=2, default=str))
+    dev_deps = section.get("dev_dependencies")
+    if dev_deps and isinstance(dev_deps, dict):
+        lines.append("Use these devDependency versions for tooling (vite, typescript, eslint, etc.):")
+        lines.append(json.dumps(dev_deps, indent=2, default=str))
     return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _normalize_hlig_language_field(hlig_node: dict) -> str:
+    """Normalize planner `language` (string or list) to a single comma-separated string."""
+    raw = hlig_node.get("language")
+    if raw is None:
+        return ""
+    if isinstance(raw, list):
+        return ", ".join(str(x).strip() for x in raw if str(x).strip())
+    return str(raw).strip()
+
+
+def _lang_has_explicit_node_backend(lang_lc: str) -> bool:
+    """True when `language` names a Node/JS HTTP server stack (caller passes lowercased string)."""
+    return bool(
+        re.search(
+            r"\b(node\.?js|express|fastify|nestjs|koa|hapi|bun|deno)\b",
+            lang_lc,
+        )
+    )
+
+
+def _hlig_id_implies_frontend(hlig_id: str) -> bool:
+    u = (hlig_id or "").upper()
+    return any(x in u for x in ("FRONTEND", "WEB-CLIENT", "SPA-UI"))
+
+
+def _hlig_id_implies_backend(hlig_id: str) -> bool:
+    u = (hlig_id or "").upper()
+    return any(
+        x in u
+        for x in (
+            "BACKEND",
+            "SERVER",
+            "MICROSERVICE",
+            "-API",
+            "API-SERVICE",
+        )
+    )
 
 
 def _infer_framework(hlig_node: dict) -> str:
@@ -395,10 +494,15 @@ def _infer_framework(hlig_node: dict) -> str:
     Infer framework from HLIG node.
     - node-react: web/JS stack when Rust is not declared, or SPA HLIGs mis-tagged Rust+web without Tauri.
     - rust-tauri: Tauri/desktop, Rust-only services, or backend/API HLIGs implemented in Rust.
+
+    HLIG ids containing BACKEND / SERVER / *-API (planner convention) pin Rust codegen unless
+    `language` explicitly names Node (Express, Fastify, …). FRONTEND-style ids pin Vite/React.
     """
+    hlig_id = str(hlig_node.get("id") or "")
     task = (hlig_node.get("task") or "").lower()
     interfaces = {str(x).lower() for x in (hlig_node.get("external_interfaces") or [])}
-    lang = (hlig_node.get("language") or "").lower()
+    lang_raw = _normalize_hlig_language_field(hlig_node)
+    lang = lang_raw.lower()
 
     def _lang_has_rust(s: str) -> bool:
         return bool(re.search(r"\brush\b", s))
@@ -419,6 +523,11 @@ def _infer_framework(hlig_node: dict) -> str:
     has_rust = _lang_has_rust(lang)
     has_tauri = _lang_has_tauri(lang)
     has_web = any(m in lang for m in web_markers)
+
+    if _hlig_id_implies_frontend(hlig_id):
+        return "node-react"
+    if _hlig_id_implies_backend(hlig_id) and not _lang_has_explicit_node_backend(lang):
+        return "rust-tauri"
 
     # Desktop / Tauri targets always need a Rust crate root.
     if "desktop" in task or has_tauri:
@@ -690,8 +799,12 @@ def _ensure_eslint_flat_config_peers(hlig_dir: Path, matrix: dict) -> None:
     section = matrix.get("node-react")
     if not isinstance(section, dict):
         return
-    mdeps = section.get("dependencies")
-    if not isinstance(mdeps, dict):
+    mdeps: dict[str, Any] = {}
+    for mk in ("dependencies", "dev_dependencies"):
+        block = section.get(mk)
+        if isinstance(block, dict):
+            mdeps.update(block)
+    if not mdeps:
         return
     dev = dict(pkg.get("devDependencies") or {})
     changed = False
@@ -821,6 +934,52 @@ def _run_local_build(hlig_dir: Path, framework: str, timeout_sec: int = 120) -> 
         return False, "", "build timed out"
     except FileNotFoundError:
         return False, "", "cargo or npm not found"
+    except Exception as e:
+        return False, "", str(e)
+
+
+def _run_project_tests(hlig_dir: Path, framework: str, timeout_sec: int = 300) -> tuple[bool, str, str]:
+    """Run automated tests (cargo test / npm test). Returns (success, stdout, stderr)."""
+    if not hlig_dir.exists():
+        return False, "", "directory does not exist"
+    if framework == "rust-tauri":
+        if timeout_sec == 300:
+            timeout_sec = _RUST_BUILD_TIMEOUT_SEC
+        try:
+            r = subprocess.run(
+                ["cargo", "test"],
+                cwd=str(hlig_dir),
+                capture_output=True,
+                timeout=timeout_sec,
+                text=True,
+            )
+            return r.returncode == 0, r.stdout or "", r.stderr or ""
+        except subprocess.TimeoutExpired:
+            return False, "", "cargo test timed out"
+        except FileNotFoundError:
+            return False, "", "cargo not found"
+        except Exception as e:
+            return False, "", str(e)
+    try:
+        pkg_path = hlig_dir / "package.json"
+        if not pkg_path.is_file():
+            return True, "", "no package.json; skip tests"
+        pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
+        scripts = pkg.get("scripts") or {}
+        if "test" not in scripts:
+            return True, "", "no npm test script; skip"
+        r = subprocess.run(
+            ["npm", "test"],
+            cwd=str(hlig_dir),
+            capture_output=True,
+            timeout=timeout_sec,
+            text=True,
+        )
+        return r.returncode == 0, r.stdout or "", r.stderr or ""
+    except subprocess.TimeoutExpired:
+        return False, "", "npm test timed out"
+    except FileNotFoundError:
+        return False, "", "npm not found"
     except Exception as e:
         return False, "", str(e)
 
@@ -1294,9 +1453,79 @@ def _normalize_node_react_jsx_files(hlig_dir: Path) -> None:
                 pass
 
 
+_NPM_DEV_NAMES = frozenset(
+    {
+        "vite",
+        "vitest",
+        "typescript",
+        "eslint",
+        "typescript-eslint",
+        "prettier",
+        "@testing-library/react",
+        "@testing-library/user-event",
+    }
+)
+_NPM_DEV_PREFIXES = ("@types/", "@typescript-eslint/", "@vitejs/")
+
+
+def _npm_use_dev_dependencies(name: str) -> bool:
+    if name in _NPM_DEV_NAMES:
+        return True
+    return any(name.startswith(p) for p in _NPM_DEV_PREFIXES)
+
+
+def _merge_npm_matrix_into_package(pkg: dict, matrix: dict) -> bool:
+    """Pin dependency and devDependency versions from agents/config/dependency_matrix.yaml (node-react)."""
+    section = matrix.get("node-react")
+    if not isinstance(section, dict):
+        return False
+    dev_block = section.get("dev_dependencies")
+    prod_block = section.get("dependencies")
+    pkg_deps = pkg.setdefault("dependencies", {})
+    pkg_dev = pkg.setdefault("devDependencies", {})
+    changed = False
+
+    def apply_version(bucket: str, key: str, raw_ver: str) -> None:
+        nonlocal changed
+        ver = raw_ver.strip()
+        if not ver or not isinstance(key, str):
+            return
+        if bucket == "dev":
+            pkg_deps.pop(key, None)
+            if pkg_dev.get(key) != ver:
+                pkg_dev[key] = ver
+                changed = True
+        else:
+            pkg_dev.pop(key, None)
+            if pkg_deps.get(key) != ver:
+                pkg_deps[key] = ver
+                changed = True
+
+    if isinstance(dev_block, dict):
+        for k, v in dev_block.items():
+            if v is None:
+                continue
+            apply_version("dev", k, str(v))
+
+    if isinstance(prod_block, dict):
+        for k, v in prod_block.items():
+            if v is None:
+                continue
+            if isinstance(dev_block, dict) and k in dev_block:
+                continue
+            if isinstance(dev_block, dict):
+                apply_version("prod", k, str(v))
+            else:
+                bucket = "dev" if _npm_use_dev_dependencies(k) else "prod"
+                apply_version(bucket, k, str(v))
+
+    return changed
+
+
 def _apply_dependency_matrix_to_node_project(hlig_dir: Path, matrix: dict) -> None:
     """
     Defensive fixes for generated Node/React/TS projects so npm run build is more likely to succeed.
+    - Merge pinned versions from dependency_matrix (node-react) into package.json.
     - Force build script to 'vite build' only (avoid tsc failing on test files).
     - Ensure tsconfig.json exists and is valid; remove invalid type refs (e.g. testing-library__jest-dom), exclude tests.
     """
@@ -1307,20 +1536,22 @@ def _apply_dependency_matrix_to_node_project(hlig_dir: Path, matrix: dict) -> No
         pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
     except Exception:
         return
+    npm_merged = _merge_npm_matrix_into_package(pkg, matrix)
     scripts = pkg.get("scripts") or {}
     build_script = (scripts.get("build") or "").strip()
-    changed = False
+    script_changed = False
     if build_script and "tsc" in build_script:
         scripts["build"] = "vite build"
-        changed = True
+        script_changed = True
     # Strip "|| echo ..." fallbacks so build fails when the real command fails (no false success)
     for key in ("build", "dev", "start"):
         val = (scripts.get(key) or "").strip()
         if "|| echo" in val or "|| true" in val:
             scripts[key] = val.split("||")[0].strip()
-            changed = True
-    if changed:
+            script_changed = True
+    if script_changed:
         pkg["scripts"] = scripts
+    if npm_merged or script_changed:
         pkg_path.write_text(json.dumps(pkg, indent=2), encoding="utf-8")
     tsconfig_path = hlig_dir / "tsconfig.json"
     try:
@@ -1444,8 +1675,29 @@ def _safe_filename(name: str) -> str:
 
 
 def _get_interfaces_for_hlig(hlig_graph: HLIGGraph, hlig_id: str) -> list[dict]:
-    """Extract interface definitions for edges involving the given HLIG node."""
+    """Extract interface definitions from HLIG contract nodes and edges involving this HLIG."""
     result: list[dict] = []
+    for nid, attrs in hlig_graph.nodes():
+        if (attrs.get("node_type") or "").lower() != "contract":
+            continue
+        prod = attrs.get("producer")
+        cons = attrs.get("consumers") or []
+        if not isinstance(cons, list):
+            cons = []
+        if hlig_id != prod and hlig_id not in cons:
+            continue
+        schema = attrs.get("schema") if isinstance(attrs.get("schema"), dict) else {}
+        result.append(
+            {
+                "from": prod,
+                "to": list(cons),
+                "interface_type": "contract",
+                "contract_node_id": nid,
+                "name": attrs.get("name"),
+                "version": attrs.get("version"),
+                **{k: v for k, v in schema.items() if k in ("type", "description", "endpoints", "schema", "ref")},
+            }
+        )
     for u, v, data in hlig_graph.edges():
         if u != hlig_id and v != hlig_id:
             continue
@@ -1863,6 +2115,56 @@ path = "src/main.rs"
         path_file = hlig_dir / CAUSAL_PATH_FILE
         path_file.write_text(json.dumps({"causal_path": causal_path}, indent=2), encoding="utf-8")
 
+    def _execute_scaffold_node(
+        self,
+        *,
+        node: dict,
+        hlig_dir: Path,
+        hlig_node: dict,
+        framework: str,
+        session_id: str,
+        hlig_graph: HLIGGraph | None,
+        hlig_id: str,
+        resolved: dict[str, str],
+        nodes_by_id: dict[str, dict],
+    ) -> None:
+        """Deterministically create empty files from IG expansion (no LLM)."""
+        nid = node.get("id", "")
+        deps = node.get("dependencies") or []
+        dep_ctx = _build_dep_ctx(deps, resolved, nodes_by_id)
+        iface_defs = _get_interfaces_for_hlig(hlig_graph, hlig_id) if hlig_graph else None
+        contracts = iface_defs if iface_defs else []
+        tech_stack = {"framework": framework}
+        tasks = expand_dtg_node(node, contracts, tech_stack, project_root=hlig_dir)
+        created: list[str] = []
+        for t in tasks:
+            fp = str(t.get("file_path") or "").strip()
+            if not fp:
+                continue
+            full = hlig_dir / fp
+            full.parent.mkdir(parents=True, exist_ok=True)
+            if not full.exists():
+                full.write_text("", encoding="utf-8")
+            created.append(fp.replace("\\", "/"))
+        brief_ctx = (json.dumps({"dependencies": dep_ctx}, default=str) if dep_ctx else "")[:2000]
+        resolved[nid] = f"scaffold:{','.join(sorted(set(created)))}\n{brief_ctx}"
+        log_pipeline_event(
+            session_id,
+            "scaffold_applied",
+            {"node": nid, "files": created},
+        )
+        _append_node_execution_log(
+            hlig_dir,
+            {
+                "node_id": nid,
+                "type": "scaffold",
+                "inputs": list(node.get("inputs_required") or []),
+                "outputs": list(node.get("outputs_produced") or []),
+                "attempts": 1,
+                "status": "success" if created else "failure",
+            },
+        )
+
     def _execute_code_node_with_per_node_build(
         self,
         *,
@@ -1881,6 +2183,7 @@ path = "src/main.rs"
         enable_local_build: bool,
         generated_design: list[str],
         generated_code_paths: list[str],
+        graph_state: Any = None,
     ) -> None:
         """
         Generate one code-type DTG node, run local build; on failure retry LLM for this node only.
@@ -1891,6 +2194,54 @@ path = "src/main.rs"
         iface_defs = _get_interfaces_for_hlig(hlig_graph, hlig_id) if hlig_graph else None
         contracts = iface_defs if iface_defs else []
         tech_stack = {"framework": framework}
+        et_exec = effective_dtg_type(node)
+        ig_early = expand_dtg_node(node, contracts, tech_stack, project_root=hlig_dir)
+        if et_exec == "build" and not ig_early:
+            ok_b, out_b, err_b = (True, "", "")
+            if enable_local_build:
+                ok_b, out_b, err_b = _run_local_build(hlig_dir, framework)
+                _write_build_log(hlig_dir, ok_b, out_b, err_b)
+            _append_node_execution_log(
+                hlig_dir,
+                {
+                    "node_id": nid,
+                    "type": et_exec,
+                    "inputs": list(node.get("inputs_required") or []),
+                    "outputs": list(node.get("outputs_produced") or []),
+                    "attempts": 1,
+                    "status": "success" if ok_b else "failure",
+                },
+            )
+            if not ok_b and _abort_on_local_build_failure():
+                raise LocalBuildFailedError(
+                    f"Build checkpoint failed for DTG node {nid}. See {hlig_dir / BUILD_LOG_FILE}",
+                    hlig_id=hlig_id,
+                    dtg_node_id=nid,
+                    stderr=err_b or out_b,
+                )
+            return
+        if et_exec == "test" and not ig_early:
+            ok_t, out_t, err_t = _run_project_tests(hlig_dir, framework)
+            _write_build_log(hlig_dir, ok_t, out_t, f"--- npm/cargo test ---\n{err_t}")
+            _append_node_execution_log(
+                hlig_dir,
+                {
+                    "node_id": nid,
+                    "type": et_exec,
+                    "inputs": list(node.get("inputs_required") or []),
+                    "outputs": list(node.get("outputs_produced") or []),
+                    "attempts": 1,
+                    "status": "success" if ok_t else "failure",
+                },
+            )
+            if not ok_t and _abort_on_local_build_failure():
+                raise LocalBuildFailedError(
+                    f"Test checkpoint failed for DTG node {nid}. See {hlig_dir / BUILD_LOG_FILE}",
+                    hlig_id=hlig_id,
+                    dtg_node_id=nid,
+                    stderr=err_t or out_t,
+                )
+            return
         shared_iface_excerpt = load_shared_interfaces_excerpt(
             hlig_dir.parent, _shared_interfaces_max_chars()
         )
@@ -1904,6 +2255,22 @@ path = "src/main.rs"
 
         for attempt in range(max_extra + 1):
             dep_ctx = _build_dep_ctx(deps, resolved, nodes_by_id)
+            in_req = [str(x) for x in (node.get("inputs_required") or []) if x is not None]
+            mc_errs = validate_node_dependency_context(
+                node_id=nid,
+                inputs_required=in_req,
+                dependency_node_ids=list(deps),
+                resolved_keys=list(dep_ctx.keys()),
+                contract_ids=None,
+            )
+            if mc_errs:
+                log_pipeline_event(
+                    session_id,
+                    "markov_context_violation",
+                    {"dtg_node_id": nid, "errors": mc_errs},
+                )
+                if _env_truthy("STRICT_MARKOV_CONTEXT", "0"):
+                    raise RuntimeError("; ".join(mc_errs))
             impl_brief = _build_implementation_brief(dep_ctx, iface_defs, node, framework)
             ig_tasks = expand_dtg_node(node, contracts, tech_stack, project_root=hlig_dir)
             log_pipeline_event(
@@ -1915,6 +2282,11 @@ path = "src/main.rs"
                     "ig_task_count": len(ig_tasks),
                 },
             )
+            if graph_state is not None and hasattr(graph_state, "record_snapshot"):
+                graph_state.record_snapshot(
+                    "expanded_ig",
+                    {hlig_id: {"dtg_node_id": nid, "ig_paths": [t.get("file_path") for t in ig_tasks]}},
+                )
 
             node_files: dict[str, str] = {}
             expected_ig_files = sum(
@@ -2077,6 +2449,28 @@ path = "src/main.rs"
                         full_path = hlig_dir / fp
                         full_path.parent.mkdir(parents=True, exist_ok=True)
                         full_path.write_text(content, encoding="utf-8")
+                        if _deterministic_on_disk_validate_enabled():
+                            cref = list(ig_task.get("contract_refs") or [])
+                            ok_d, errs_d = deterministic_validate_file(
+                                full_path,
+                                cref,
+                                project_root=hlig_dir,
+                                framework=framework,
+                            )
+                            if not ok_d:
+                                mech_err = f"{fp} (deterministic):\n" + "\n".join(errs_d[:20])
+                                log_pipeline_event(
+                                    session_id,
+                                    "deterministic_file_validate_failed",
+                                    {
+                                        "path": fp,
+                                        "node": nid,
+                                        "step": step + 1,
+                                        "errors": errs_d[:10],
+                                    },
+                                )
+                                content = ""
+                                continue
                         ok_tool, msg_tool = extra_toolchain_validate(fp, content, framework, hlig_dir)
                         if not ok_tool:
                             mech_err = f"{fp} (toolchain): {msg_tool}"
@@ -2176,6 +2570,17 @@ path = "src/main.rs"
             if not enable_local_build:
                 if ig_record:
                     _append_ig_execution_log(hlig_dir, ig_record)
+                _append_node_execution_log(
+                    hlig_dir,
+                    {
+                        "node_id": nid,
+                        "type": effective_dtg_type(node),
+                        "inputs": list(node.get("inputs_required") or []),
+                        "outputs": list(node.get("outputs_produced") or []),
+                        "attempts": attempt + 1,
+                        "status": "success",
+                    },
+                )
                 for p in files:
                     if p not in generated_code_paths:
                         generated_code_paths.append(p)
@@ -2189,12 +2594,44 @@ path = "src/main.rs"
             success, out, err = _run_local_build(hlig_dir, framework)
             _write_build_log(hlig_dir, success, out, err)
             if success:
+                if effective_dtg_type(node) == "test":
+                    tok, ot, etk = _run_project_tests(hlig_dir, framework)
+                    _write_build_log(hlig_dir, tok, ot, f"--- tests ---\n{etk}")
+                    if not tok:
+                        last_err = etk or ot or ""
+                        compile_errors = f"Tests failed.\nstdout:\n{ot}\nstderr:\n{etk}"
+                        if files:
+                            previous_attempt_files = _snapshot_project_files_for_retry(hlig_dir, framework, files)
+                        else:
+                            previous_attempt_files = None
+                        log_pipeline_event(
+                            session_id,
+                            "test_retry",
+                            {
+                                "hlig": hlig_id,
+                                "dtg_node": nid,
+                                "attempt": attempt + 1,
+                                "stderr_preview": last_err[:500],
+                            },
+                        )
+                        continue
                 if ig_record:
                     _append_ig_execution_log(hlig_dir, ig_record)
                 log_pipeline_event(
                     session_id,
                     "local_build_ok",
                     {"hlig": hlig_id, "dtg_node": nid, "attempt": attempt + 1},
+                )
+                _append_node_execution_log(
+                    hlig_dir,
+                    {
+                        "node_id": nid,
+                        "type": effective_dtg_type(node),
+                        "inputs": list(node.get("inputs_required") or []),
+                        "outputs": list(node.get("outputs_produced") or []),
+                        "attempts": attempt + 1,
+                        "status": "success",
+                    },
                 )
                 for p in files:
                     if p not in generated_code_paths:
@@ -2225,6 +2662,17 @@ path = "src/main.rs"
                 {**ig_record, "status": "failure"},
             )
         if _abort_on_local_build_failure():
+            _append_node_execution_log(
+                hlig_dir,
+                {
+                    "node_id": nid,
+                    "type": effective_dtg_type(node),
+                    "inputs": list(node.get("inputs_required") or []),
+                    "outputs": list(node.get("outputs_produced") or []),
+                    "attempts": max_extra + 1,
+                    "status": "failure",
+                },
+            )
             raise LocalBuildFailedError(
                 f"Local build failed for HLIG {hlig_id} DTG node {nid} after {max_extra + 1} attempt(s). "
                 f"See {hlig_dir / BUILD_LOG_FILE}",
@@ -2254,12 +2702,15 @@ path = "src/main.rs"
         session_id: str,
         hlig_graph: HLIGGraph | None = None,
         causal_parent_context: dict[str, str] | None = None,
+        graph_state: Any = None,
     ) -> Path | None:
         """
         Generate design docs and code for one HLIG node's DTG.
         CVP: causal_parent_context (Markov blanket) restricts context to causal parents only.
         Returns the HLIG subdirectory path or None on failure.
         """
+        if (hlig_node.get("node_type") or "").lower() == "contract":
+            return None
         hlig_dir = outputs_dir / hlig_id
         hlig_dir.mkdir(parents=True, exist_ok=True)
         designs_dir = hlig_dir / "designs"
@@ -2278,6 +2729,15 @@ path = "src/main.rs"
             self._write_causal_path_metadata(hlig_dir, causal_path)
 
         framework = _infer_framework(hlig_node)
+        log_pipeline_event(
+            session_id,
+            "framework_inferred",
+            {
+                "hlig_id": hlig_id,
+                "framework": framework,
+                "language_normalized": _normalize_hlig_language_field(hlig_node) or None,
+            },
+        )
         order = _topological_order(dtg)
         nodes_by_id = {n["id"]: n for n in order if n.get("id")}
         resolved: dict[str, str] = {}
@@ -2289,6 +2749,21 @@ path = "src/main.rs"
         # Design nodes run once
         for node in order:
             nid = node.get("id", "")
+            if effective_dtg_type(node) == "review":
+                continue
+            if is_scaffold_node(node):
+                self._execute_scaffold_node(
+                    node=node,
+                    hlig_dir=hlig_dir,
+                    hlig_node=hlig_node,
+                    framework=framework,
+                    session_id=session_id,
+                    hlig_graph=hlig_graph,
+                    hlig_id=hlig_id,
+                    resolved=resolved,
+                    nodes_by_id=nodes_by_id,
+                )
+                continue
             if not is_design_like_node(node):
                 continue
             deps = node.get("dependencies") or []
@@ -2305,10 +2780,23 @@ path = "src/main.rs"
                 resolved[nid] = _truncate_design(doc)
                 generated_design.append(f"designs/{fp.name}")
             log_pipeline_event(session_id, "design_generated", {"node": nid})
+            _append_node_execution_log(
+                hlig_dir,
+                {
+                    "node_id": nid,
+                    "type": effective_dtg_type(node),
+                    "inputs": list(node.get("inputs_required") or []),
+                    "outputs": list(node.get("outputs_produced") or []),
+                    "attempts": 1,
+                    "status": "success" if doc else "failure",
+                },
+            )
 
         enable_local_build = os.environ.get("ENABLE_LOCAL_BUILD", "1").strip().lower() not in ("0", "false", "no")
         generated_code_paths: list[str] = []
         for node in order:
+            if effective_dtg_type(node) == "review":
+                continue
             if not is_code_execution_node(node):
                 continue
             self._execute_code_node_with_per_node_build(
@@ -2327,7 +2815,11 @@ path = "src/main.rs"
                 enable_local_build=enable_local_build,
                 generated_design=generated_design,
                 generated_code_paths=generated_code_paths,
+                graph_state=graph_state,
             )
+        _maybe_validate_project_layout(
+            hlig_dir, dtg, framework, session_id=session_id, hlig_id=hlig_id
+        )
         return hlig_dir
 
     def _load_existing_design_docs(self, designs_dir: Path) -> dict[str, str]:
@@ -2380,6 +2872,8 @@ path = "src/main.rs"
 
         for nid in topo_order:
             data = node_data_by_id.get(nid, {})
+            if (data.get("node_type") or "").lower() == "contract":
+                continue
             dtg = data.get("dtg")
             if not isinstance(dtg, DTGGraph):
                 continue
@@ -2437,6 +2931,7 @@ path = "src/main.rs"
         session_id: str,
         outputs_dir: Path,
         has_design_docs: bool = True,
+        graph_state: Any = None,
     ) -> Path | None:
         """
         Generate only code for code-type DTG nodes.
@@ -2449,6 +2944,8 @@ path = "src/main.rs"
 
         for nid in topo_order:
             data = node_data_by_id.get(nid, {})
+            if (data.get("node_type") or "").lower() == "contract":
+                continue
             dtg = data.get("dtg")
             if not isinstance(dtg, DTGGraph):
                 continue
@@ -2459,7 +2956,6 @@ path = "src/main.rs"
 
             try:
                 hlig_dir.mkdir(parents=True, exist_ok=True)
-                framework = _infer_framework(hlig_node)
                 designs_dir = hlig_dir / "designs"
                 if has_design_docs and designs_dir.exists():
                     resolved = self._load_existing_design_docs(designs_dir)
@@ -2484,9 +2980,36 @@ path = "src/main.rs"
                         {"id": nid3, "task": d.get("task", ""), "outputs": d.get("outputs", [])}
                         for nid3, d in path_tuples
                     ]
+                framework = _infer_framework(hlig_node)
+                log_pipeline_event(
+                    session_id,
+                    "framework_inferred",
+                    {
+                        "hlig_id": nid,
+                        "framework": framework,
+                        "language_normalized": _normalize_hlig_language_field(hlig_node) or None,
+                    },
+                )
                 self._scaffold_project(hlig_dir, framework, hlig_node)
+                for node in order:
+                    if effective_dtg_type(node) == "review":
+                        continue
+                    if is_scaffold_node(node):
+                        self._execute_scaffold_node(
+                            node=node,
+                            hlig_dir=hlig_dir,
+                            hlig_node=hlig_node,
+                            framework=framework,
+                            session_id=session_id,
+                            hlig_graph=hlig_graph,
+                            hlig_id=nid,
+                            resolved=resolved,
+                            nodes_by_id=nodes_by_id,
+                        )
                 generated_code_paths: list[str] = []
                 for node in order:
+                    if effective_dtg_type(node) == "review":
+                        continue
                     if not is_code_execution_node(node):
                         continue
                     self._execute_code_node_with_per_node_build(
@@ -2505,7 +3028,11 @@ path = "src/main.rs"
                         enable_local_build=enable_local_build,
                         generated_design=generated_design_refs,
                         generated_code_paths=generated_code_paths,
+                        graph_state=graph_state,
                     )
+                _maybe_validate_project_layout(
+                    hlig_dir, dtg, framework, session_id=session_id, hlig_id=nid
+                )
                 task = hlig_node.get("task", "")
                 readme = hlig_dir / "README.md"
                 summary = readme.read_text(encoding="utf-8")[:3000] if readme.exists() else ""
@@ -2543,6 +3070,8 @@ path = "src/main.rs"
 
         for nid in topo_order:
             data = node_data_by_id.get(nid, {})
+            if (data.get("node_type") or "").lower() == "contract":
+                continue
             dtg = data.get("dtg")
             if not isinstance(dtg, DTGGraph):
                 continue
@@ -2557,6 +3086,7 @@ path = "src/main.rs"
                     nid, hlig_node, dtg, outputs_dir, session_id,
                     hlig_graph=hlig_graph,
                     causal_parent_context=causal_parent_context if causal_parent_context else None,
+                    graph_state=None,
                 )
                 if result_path:
                     # Store summary for downstream Markov blanket scoping
