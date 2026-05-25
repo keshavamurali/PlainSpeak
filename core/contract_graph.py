@@ -17,9 +17,22 @@ def validate_hlig_contract_nodes(nodes: list[dict], edges: list[dict]) -> list[s
     for n in nodes:
         if not isinstance(n, dict) or not n.get("id"):
             continue
-        if (n.get("node_type") or "").lower() != "contract":
+        kind = str(n.get("kind") or "").strip().lower()
+        legacy_contract = (n.get("node_type") or "").lower() == "contract"
+        if not (kind == "contract" or legacy_contract):
             continue
         nid = n["id"]
+        # v2 contract-first path: source_of_truth is authoritative
+        if isinstance(n.get("source_of_truth"), dict):
+            sot = n.get("source_of_truth") or {}
+            if not sot.get("uri"):
+                errs.append(f"HLIG contract node '{nid}': source_of_truth.uri is required")
+            impl = n.get("implemented_by")
+            if impl is not None and (not isinstance(impl, list) or not all(str(x) in node_ids for x in impl)):
+                errs.append(
+                    f"HLIG contract node '{nid}': implemented_by must be an array of existing node ids"
+                )
+            continue
         prod = n.get("producer")
         if not prod or str(prod) not in node_ids:
             errs.append(f"HLIG contract node '{nid}': producer '{prod}' must reference an existing HLIG node id")

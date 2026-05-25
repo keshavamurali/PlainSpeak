@@ -1,5 +1,6 @@
 """Config-driven agent runner using a Plan Graph from the Planner."""
 
+import re
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -9,13 +10,22 @@ from context.execution_context import ExecutionContext
 from agents.base import BaseAgent
 from core.plan_graph import PlanGraph
 from core.expansion_engine import EXPANSION_STRATEGIES, default_expansion_strategy_for_node
-from core.hlig_dtg_graphs import HLIGGraph, DTGGraph, GraphCycleError
+from core.hlig_dtg_graphs import (
+    HLIGGraph,
+    DTGGraph,
+    GraphCycleError,
+    planner_hlig_completeness_errors,
+    planner_contract_semantic_errors,
+)
+from core.graph_spec_validator import validate_hlig
+from spec.clarification_canonical import clarification_canonical_errors
 
 try:
     from core.debug_logger import (
         log_pipeline_event,
         log_user_input,
         get_session_usage,
+        get_cost_limit_usd,
         log_token_summary,
         CostLimitExceeded,
         log_graph_execution_trace,
@@ -24,6 +34,7 @@ try:
 except ImportError:
     log_pipeline_event = log_user_input = lambda *a, **kw: None
     get_session_usage = lambda _: {}
+    get_cost_limit_usd = lambda: 0.0
     log_token_summary = lambda *a, **kw: None
     CostLimitExceeded = Exception  # noqa: type for isinstance check
     log_graph_execution_trace = lambda *a, **kw: None
@@ -54,6 +65,34 @@ def _get_event_bus():
         return event_bus
     except ImportError:
         return None
+
+
+def _extract_answer_map(questions: list[dict], user_response: str) -> dict[str, str]:
+    """
+    Parse user response lines in the form `id: answer`.
+    Falls back to first question id if no keyed lines are found.
+    """
+    if not user_response:
+        return {}
+    valid_ids = {str(q.get("id", "")).strip() for q in questions if isinstance(q, dict)}
+    valid_ids = {x for x in valid_ids if x}
+    out: dict[str, str] = {}
+    for line in str(user_response).splitlines():
+        m = re.match(r"^\s*([A-Za-z0-9_.-]+)\s*:\s*(.+?)\s*$", line)
+        if not m:
+            continue
+        k = m.group(1).strip()
+        v = m.group(2).strip()
+        if not v:
+            continue
+        if not valid_ids or k in valid_ids:
+            out[k] = v
+    if out:
+        return out
+    if len(valid_ids) == 1:
+        only = next(iter(valid_ids))
+        return {only: str(user_response).strip()}
+    return {}
 
 
 def _default_plan_from_config(steps: list[dict], pipeline: list[str]) -> dict:
@@ -124,9 +163,25 @@ class AgentRunner:
         artifact = ctx.get_artifact("designer", {})
         if isinstance(artifact, dict):
             out = artifact.get("output")
-            if isinstance(out, dict) and "nodes" in out:
+            if isinstance(out, dict):
                 return out
         return None
+
+    @staticmethod
+    def _node_kind(node: dict) -> str:
+        kind = str(node.get("kind") or "").strip().lower()
+        if kind:
+            return kind
+        if str(node.get("node_type") or "").strip().lower() == "contract":
+            return "contract"
+        nid = str(node.get("id") or "").upper()
+        if "-DTG-" in nid or nid.startswith("DTG-"):
+            return "atomic"
+        return "composite"
+
+    @staticmethod
+    def _is_contract_node(node: dict) -> bool:
+        return AgentRunner._node_kind(node) == "contract"
 
     @staticmethod
     def _normalize_planner_language(raw: Any) -> str:
@@ -176,8 +231,8 @@ class AgentRunner:
         parent_hlig = {
             "id": hlig_node.get("id", ""),
             "task": hlig_node.get("task"),
-            "inputs": hlig_node.get("inputs", []),
-            "outputs": hlig_node.get("outputs", []),
+            "inputs": hlig_node.get("inputs", hlig_node.get("inputs_required", [])),
+            "outputs": hlig_node.get("outputs", hlig_node.get("outputs_produced", [])),
             "language": lang,
             "external_interfaces": hlig_node.get("external_interfaces", []),
         }
@@ -185,6 +240,15 @@ class AgentRunner:
             if isinstance(n, dict):
                 n["parent_hlig"] = parent_hlig
                 n["language"] = lang
+                impl = n.get("implementation")
+                if not isinstance(impl, dict):
+                    impl = {}
+                impl.setdefault("language", lang)
+                impl.setdefault("framework", "auto")
+                impl.setdefault("runtime", "default")
+                if n.get("task_type") in ("test", "verification"):
+                    impl.setdefault("framework", "test-runner")
+                n["implementation"] = impl
                 tt = (n.get("task_type") or "").lower()
                 if tt in ("code", "integration", "test", "build", "verification", "scaffold"):
                     es = (n.get("expansion_strategy") or "").strip()
@@ -192,16 +256,66 @@ class AgentRunner:
                         n["expansion_strategy"] = default_expansion_strategy_for_node(parent_hlig, n)
         return dtg_out
 
+    @staticmethod
+    def _normalize_designer_output(dtg_out: dict, hlig_node: dict) -> dict:
+        """Accept v2 child_graph output and convert to DTG-compatible shape for runtime."""
+        if not isinstance(dtg_out, dict):
+            return {}
+        if isinstance(dtg_out.get("child_graph"), dict):
+            child = dtg_out.get("child_graph") or {}
+            nodes = []
+            for n in child.get("nodes") or []:
+                if not isinstance(n, dict):
+                    continue
+                kind = AgentRunner._node_kind(n)
+                if kind not in ("atomic", "contract"):
+                    continue
+                nd = dict(n)
+                nd.pop("child_graph", None)
+                nd.setdefault("task_type", "contract" if kind == "contract" else "code")
+                nd.setdefault("title", nd.get("task") or nd.get("id") or "Untitled task")
+                nd.setdefault("description", nd.get("description") or nd.get("task") or nd.get("title") or "")
+                nd["inputs_required"] = list(nd.get("inputs_required") or nd.get("inputs") or [])
+                nd["outputs_produced"] = list(nd.get("outputs_produced") or nd.get("outputs") or [])
+                nd.setdefault("dependencies", list(nd.get("dependencies") or []))
+                nd.setdefault("success_criteria", list(nd.get("success_criteria") or []))
+                nodes.append(nd)
+            member_ids = {str(n.get("id")) for n in nodes if n.get("id")}
+            edges = []
+            for e in child.get("edges") or []:
+                if not isinstance(e, dict):
+                    continue
+                u = e.get("from") or e.get("source")
+                v = e.get("to") or e.get("target")
+                if not u or not v:
+                    continue
+                if str(u) not in member_ids or str(v) not in member_ids:
+                    continue
+                ed = {"from": u, "to": v}
+                for k, val in e.items():
+                    if k in ("from", "to", "source", "target"):
+                        continue
+                    ed[k] = val
+                edges.append(ed)
+            return {"hlig_node_id": hlig_node.get("id"), "nodes": nodes, "edges": edges}
+        if "nodes" in dtg_out:
+            return dtg_out
+        return {}
+
     def _generate_dtgs_for_hlig(self, ctx: ExecutionContext, hlig_graph: HLIGGraph, steps: dict) -> None:
         """Traverse HLIG nodes, generate DTG for each, attach to node. Retries designer once on DTG cycle."""
         designer_config = (steps.get("designer") or {}).get("config") or {}
         for nid, data in list(hlig_graph.nodes()):
-            if (data.get("node_type") or "").lower() == "contract":
+            if self._is_contract_node(data):
+                continue
+            if data.get("dtg"):
+                # Already available via recursive child_graph -> DTG conversion.
                 continue
             node_dict = {"id": nid, **{k: v for k, v in data.items() if k != "dtg" and not callable(v)}}
             node_dict.update(designer_config)  # Inject max_design_nodes, max_code_nodes for coarser DTG
             log_pipeline_event(ctx.session_id, "dtg_generation_started", {"hlig_node": nid})
-            dtg_out = self._run_dtg_generator(node_dict, steps, ctx)
+            dtg_out_raw = self._run_dtg_generator(node_dict, steps, ctx)
+            dtg_out = self._normalize_designer_output(dtg_out_raw or {}, node_dict)
             if dtg_out and isinstance(dtg_out, dict):
                 dtg_out = self._enrich_dtg_nodes(dtg_out, node_dict)
                 try:
@@ -219,7 +333,8 @@ class AgentRunner:
                         "dtg_cycle_retry_hint": str(e),
                         "dtg_cycle_edges": e.cycle_edges,
                     }
-                    dtg_out_retry = self._run_dtg_generator(retry_dict, steps, ctx)
+                    dtg_out_retry_raw = self._run_dtg_generator(retry_dict, steps, ctx)
+                    dtg_out_retry = self._normalize_designer_output(dtg_out_retry_raw or {}, node_dict)
                     if dtg_out_retry and isinstance(dtg_out_retry, dict):
                         dtg_out_retry = self._enrich_dtg_nodes(dtg_out_retry, node_dict)
                         try:
@@ -247,16 +362,31 @@ class AgentRunner:
             prompt=spec.get("prompt"),
             config=spec.get("config", {}),
             multi_mcp=self._multi_mcp,
-            reads=["original_query", "user_clarification", "prior_spec"],
+            reads=[
+                "original_query",
+                "user_clarification",
+                "clarification_answers",
+                "clarification_canonical",
+                "prior_spec",
+            ],
             writes=["hlig"],
         )
         ctx = agent.run(ctx)
         artifact = ctx.get_artifact("planner", {})
         if not isinstance(artifact, dict):
             return None
+        if artifact.get("error"):
+            raise RuntimeError(f"Planner failed: {artifact['error']}")
         out = artifact.get("output")
         if isinstance(out, dict):
             return out
+        if isinstance(out, str) and out.strip():
+            preview = out.strip()[:800] + ("…" if len(out.strip()) > 800 else "")
+            raise RuntimeError(
+                "Planner did not return valid JSON (expected clarification questions or an HLIG object). "
+                "Check GEMINI_API_KEY / model config and server logs. "
+                f"Raw preview: {preview!r}"
+            )
         return None
 
     def _run_node(
@@ -580,6 +710,11 @@ class AgentRunner:
         ctx.globals_schema.setdefault("original_query", ctx.get_state("query", ""))
 
         log_pipeline_event(ctx.session_id, "run_started", {"query": ctx.get_state("query", "")})
+        log_pipeline_event(
+            ctx.session_id,
+            "cost_limit_config",
+            {"cost_limit_usd": get_cost_limit_usd(), "enabled": get_cost_limit_usd() > 0},
+        )
         log_graph_execution_trace(
             ctx.session_id,
             "run_started",
@@ -625,6 +760,13 @@ class AgentRunner:
                     "user_clarification",
                 )
                 log_user_input(ctx.session_id, "planner_clarification", msg, user_response)
+                answer_map = _extract_answer_map(questions, user_response)
+                if answer_map:
+                    existing_map = ctx.globals_schema.get("clarification_answers", {})
+                    if not isinstance(existing_map, dict):
+                        existing_map = {}
+                    existing_map.update(answer_map)
+                    ctx.globals_schema["clarification_answers"] = existing_map
                 # Accumulate responses so planner sees full history (avoids repeated questions)
                 existing = ctx.globals_schema.get("user_clarification", "")
                 ctx.globals_schema["user_clarification"] = (
@@ -636,7 +778,39 @@ class AgentRunner:
                     except Exception:
                         pass
                 continue
-            if planner_out.get("hlig"):
+            if planner_out.get("hlig") or planner_out.get("graph"):
+                hlig_block = planner_out.get("hlig") or planner_out.get("graph") or {}
+                comp_errs = list(planner_hlig_completeness_errors(hlig_block))
+                comp_errs.extend(planner_contract_semantic_errors(hlig_block))
+                if planner_out.get("graph"):
+                    comp_errs.extend(validate_hlig({"graph": hlig_block}))
+                else:
+                    comp_errs.extend(validate_hlig({"hlig": hlig_block}))
+                comp_errs.extend(clarification_canonical_errors(planner_out.get("clarification_canonical")))
+                if comp_errs:
+                    c_retry = ctx.globals_schema.get("hlig_completeness_retry_count", 0)
+                    if c_retry < 2:
+                        ctx.globals_schema["hlig_completeness_retry_count"] = c_retry + 1
+                        existing = ctx.globals_schema.get("user_clarification", "")
+                        detail = "; ".join(comp_errs)
+                        sys_msg = (
+                            f"[System: Validation failed ({detail}). "
+                            "Fix ALL of: (1) complete HLIG — two+ implementation nodes, "
+                            'node_type "contract" for shared boundaries, edges producer→contract→consumer; '
+                            "(2) top-level clarification_canonical with every required key from the prompt schema, "
+                            "filled from the user's plain-language answers; "
+                            "(3) each implementation node's task is one clear encapsulated responsibility.]"
+                        )
+                        ctx.globals_schema["user_clarification"] = (
+                            f"{existing}\n\n{sys_msg}".strip() if existing else sys_msg
+                        )
+                        log_pipeline_event(
+                            ctx.session_id,
+                            "hlig_completeness_retry",
+                            {"retry": c_retry + 1, "errors": comp_errs},
+                        )
+                        continue
+                    raise ValueError("Planning output incomplete after retries: " + "; ".join(comp_errs))
                 try:
                     from spec.spec_models import merge_planner_spec_with_hlig
 
@@ -645,11 +819,10 @@ class AgentRunner:
                     ctx.globals_schema["spec"] = spec_merged
                     ctx.globals_schema["prior_spec"] = spec_merged
                     ctx.graph_state.record_snapshot("spec_snapshot", spec_merged)
-                    hlig_block = planner_out.get("hlig") or {}
                     contract_nodes = [
                         n
-                        for n in (hlig_block.get("nodes") or [])
-                        if isinstance(n, dict) and (n.get("node_type") or "").lower() == "contract"
+                        for n in ((hlig_block.get("nodes") or []) if isinstance(hlig_block, dict) else [])
+                        if isinstance(n, dict) and self._is_contract_node(n)
                     ]
                     ctx.graph_state.record_snapshot("contract_graph", {"nodes": contract_nodes})
 
@@ -663,6 +836,9 @@ class AgentRunner:
                         )
                     if hlig_graph:
                         ctx.hlig_graph = hlig_graph
+                    cc = planner_out.get("clarification_canonical")
+                    if isinstance(cc, dict):
+                        ctx.globals_schema["clarification_canonical"] = cc
                 except GraphCycleError as e:
                     retry_count = ctx.globals_schema.get("hlig_cycle_retry_count", 0)
                     log_pipeline_event(
@@ -703,8 +879,9 @@ class AgentRunner:
             },
         )
 
-        # Mark planner done when we already ran it (full pipeline with HLIG)
-        if ctx.hlig_graph and "designer" in step_names and "design_reviewer" in step_names:
+        # Mark planner done when we already ran it in phase 1.
+        # This prevents re-running planner in planning-only mode.
+        if ctx.hlig_graph and "planner" in step_names:
             planner_node_id = next(
                 (nid for nid, data in plan.nodes() if data.get("agent") == "planner"),
                 None,
@@ -718,8 +895,24 @@ class AgentRunner:
 
         # Phase 2: DAG execution
         bus = _get_event_bus()
+        should_replan = False
+        failed_node_id = ""
+        failed_error = ""
         try:
             while plan.has_pending():
+                if should_replan:
+                    replanned = self._replan(
+                        ctx=ctx,
+                        failed_node_id=failed_node_id,
+                        error=failed_error,
+                        current_plan=plan,
+                        steps=steps,
+                    )
+                    should_replan = False
+                    if replanned is None:
+                        raise RuntimeError(f"Node {failed_node_id} failed: {failed_error}")
+                    plan = replanned
+                    continue
                 ready = plan.get_ready_steps()
                 if not ready:
                     break
@@ -865,6 +1058,25 @@ class AgentRunner:
                                 "status": fd.get("status"),
                             },
                         )
+                        retry_counts = ctx.globals_schema.setdefault("node_retry_counts", {})
+                        nretries = int(retry_counts.get(node_id, 0))
+                        max_retries = 1
+                        if nretries < max_retries:
+                            retry_counts[node_id] = nretries + 1
+                            should_replan = True
+                            failed_node_id = node_id
+                            failed_error = str(e)
+                            log_pipeline_event(
+                                ctx.session_id,
+                                "node_replan_requested",
+                                {
+                                    "node_id": node_id,
+                                    "retry": nretries + 1,
+                                    "max_retries": max_retries,
+                                    "error": str(e)[:500],
+                                },
+                            )
+                            break
                         raise
         except CostLimitExceeded:
             # Log final cost and run_completed before re-raising so logs show why run stopped
@@ -944,5 +1156,22 @@ class AgentRunner:
             if data.get("status") == "completed"
         ]
         failed = [failed_node_id]
-        # TODO: Run Planner with completed_steps, failed_steps; parse new plan_graph
-        return None
+        log_pipeline_event(
+            ctx.session_id,
+            "replan",
+            {
+                "failed_node": failed_node_id,
+                "error": error[:1000],
+                "completed_steps": completed,
+                "failed_steps": failed,
+            },
+        )
+        node = current_plan.get_node(failed_node_id) or {}
+        if not node:
+            return None
+        # Minimal replan strategy: reset only the failed node so DAG can retry once.
+        node["status"] = "pending"
+        node["error"] = None
+        node["start_time"] = None
+        node["end_time"] = None
+        return current_plan

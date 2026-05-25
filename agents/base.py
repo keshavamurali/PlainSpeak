@@ -85,6 +85,24 @@ class BaseAgent:
             block_content = query
             if clarification:
                 block_content = f"{query}\n\n[User's clarification responses:]\n{clarification}"
+            clarification_answers = input_data.get("clarification_answers")
+            if isinstance(clarification_answers, dict) and clarification_answers:
+                try:
+                    answers_txt = json.dumps(clarification_answers, indent=2, default=str)
+                except TypeError:
+                    answers_txt = str(clarification_answers)
+                block_content = (
+                    f"{block_content}\n\n[Clarification answers by question id (structured)]:\n{answers_txt}"
+                )
+            canonical = input_data.get("clarification_canonical")
+            if isinstance(canonical, dict) and canonical:
+                try:
+                    canon_txt = json.dumps(canonical, indent=2, default=str)
+                except TypeError:
+                    canon_txt = str(canonical)
+                block_content = (
+                    f"{block_content}\n\n[Clarification (machine-readable JSON — refine HLIG/SPEC to match):]\n{canon_txt}"
+                )
             prior_spec = input_data.get("prior_spec")
             if prior_spec is not None:
                 try:
@@ -102,7 +120,11 @@ class BaseAgent:
                 flags=re.DOTALL,
             )
         elif self.name == "designer":
-            writes_hint = "\n\nYour output must be valid JSON with keys: hlig_node_id, nodes, edges."
+            writes_hint = (
+                "\n\nYour output must be valid JSON. "
+                "Preferred v2 shape: {\"child_graph\": {\"nodes\": [...], \"edges\": [...]}}. "
+                "Backward-compatible shape is allowed: {\"hlig_node_id\": ..., \"nodes\": [...], \"edges\": [...]}."
+            )
             full_prompt = f"{prompt_text.strip()}{writes_hint}\n\n## HLIG Node (input)\n\n```json\n{json.dumps(input_data, indent=2)}\n```"
         else:
             writes_hint = ""
@@ -115,7 +137,7 @@ class BaseAgent:
             usage_dict = usage._asdict() if usage else None
             # Log only variable input (not prompt template from .md) to keep debug logs smaller
             if self.name == "planner":
-                variable_input = block_content
+                variable_input = block_content  # includes query, clarifications, optional canonical, prior spec
             else:
                 variable_input = json.dumps(input_data, indent=2)
             log_llm_call(
@@ -149,9 +171,18 @@ class BaseAgent:
         output = self._call_llm(prompt_text, input_data, session_id)
 
         if isinstance(output, dict) and "_error" in output:
-            output = "TODO: LLM output"  # Fallback when LLM unavailable
-        elif isinstance(output, dict) and "_raw" in output:
-            output = output.get("output", "TODO: LLM output")
+            err = str(output.get("_error", "Unknown LLM error"))
+            log_step_end(session_id, self.name, {"_error": err})
+            ctx.add_artifact(
+                self.name,
+                {"prompt": prompt_text, "output": None, "error": err},
+            )
+            raise RuntimeError(
+                f"LLM call failed for agent '{self.name}': {err}. "
+                "For Gemini set GEMINI_API_KEY (or use Ollama; see README)."
+            )
+        if isinstance(output, dict) and "_raw" in output:
+            output = output.get("output", "")
 
         log_step_end(session_id, self.name, output)
         ctx.add_artifact(self.name, {"prompt": prompt_text, "output": output})

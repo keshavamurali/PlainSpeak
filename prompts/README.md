@@ -1,6 +1,6 @@
 # Prompts
 
-Add agent prompts here as `.md` files. Each file corresponds to an agent type (e.g. `planner.md`, `code_generator.md`, `reviewer.md`). The pipeline `coder` step uses `code_generator.md` (loaded by `DTGArtifactGenerator` for DTG codegen).
+Add agent prompts here as `.md` files. Each file corresponds to an agent type (e.g. `planner.md`, `code_generator.md`, `reviewer.md`). The pipeline `coder` step uses `code_generator.md` (loaded by `DTGArtifactGenerator` for atomic DTG codegen within the recursive graph model).
 
 Reference these in `agents/config/agents.yaml` via the `prompt_file` config key.
 

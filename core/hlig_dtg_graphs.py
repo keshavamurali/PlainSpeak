@@ -49,6 +49,24 @@ def _split_hlig_control_and_data_edges(edges: list[dict]) -> tuple[list[dict], l
     return control, data
 
 
+def _node_kind(node: dict[str, Any]) -> str:
+    """Return normalized node kind across legacy/new schemas."""
+    if not isinstance(node, dict):
+        return ""
+    kind = str(node.get("kind") or "").strip().lower()
+    if kind:
+        return kind
+    node_type = str(node.get("node_type") or "").strip().lower()
+    if node_type == "contract":
+        return "contract"
+    nid = str(node.get("id") or "").strip().upper()
+    if "-DTG-" in nid or nid.startswith("DTG-"):
+        return "atomic"
+    if "-CONTRACT-" in nid or node_type == "contract":
+        return "contract"
+    return "composite"
+
+
 def break_hlig_control_edges_until_dag(
     control_edges: list[dict],
     node_ids: set[str],
@@ -57,8 +75,8 @@ def break_hlig_control_edges_until_dag(
     Remove control edges until the graph is a DAG.
 
     Each iteration finds one directed cycle and removes one edge on that cycle:
-    prefer edges **without** `interface_spec` / `interface_ref` (duplicate / causal ping-pong)
-    so contracts on typed edges are kept. Tie-break: lexicographically larger (from, to).
+    prefer soft/implicit edges first and preserve causal explicit edges where possible.
+    Tie-break: lexicographically larger (from, to).
 
     Preserves full dicts for remaining edges. Returns (new_control_edges, removed_summaries).
     """
@@ -98,11 +116,13 @@ def break_hlig_control_edges_until_dag(
         pair_set = set(pairs)
 
         def _strip_priority(e: dict) -> tuple:
-            """Higher = remove first: drop edges without interface payload before contract edges."""
+            """Higher = remove first: prefer removing soft/non-causal edges first."""
             u, v = e.get("from") or "", e.get("to") or ""
-            has_payload = bool(e.get("interface_spec") or e.get("interface_ref"))
-            tier = 0 if has_payload else 1
-            return (tier, u, v)
+            dep = str(e.get("dependency_type") or "").lower()
+            causal = bool(e.get("causal", True))
+            soft_rank = 1 if dep == "soft" else 0
+            causal_rank = 0 if causal else 1
+            return (soft_rank, causal_rank, u, v)
 
         match_indices = [
             i for i, e in enumerate(working) if (e.get("from"), e.get("to")) in pair_set
@@ -135,6 +155,144 @@ def _raise_if_cycle(
             cycle_repr,
             hlig_node_id=hlig_node_id,
         )
+
+
+def planner_hlig_completeness_errors(hlig: dict[str, Any]) -> list[str]:
+    """
+    Minimum structural bar for a multi-subsystem HLIG (planning phase).
+
+    Rejects under-spec model output such as a lone frontend node with no edges,
+    no backend, and no contract nodes—common failure mode when the model over-simplifies.
+    """
+    errors: list[str] = []
+    if not isinstance(hlig, dict):
+        return ["HLIG must be a JSON object."]
+    is_recursive_shape = isinstance(hlig.get("graph"), dict)
+    if is_recursive_shape:
+        g = hlig.get("graph") or {}
+        nodes = g.get("nodes") or []
+        edges = g.get("edges") or []
+    elif isinstance(hlig.get("hlig"), dict):
+        g = hlig.get("hlig") or {}
+        nodes = g.get("nodes") or []
+        edges = g.get("edges") or []
+    else:
+        nodes = hlig.get("nodes") or []
+        edges = hlig.get("edges") or []
+    def _walk_nodes(ns: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for node in ns:
+            if not isinstance(node, dict):
+                continue
+            out.append(node)
+            cg = node.get("child_graph")
+            if isinstance(cg, dict):
+                out.extend(_walk_nodes(cg.get("nodes") or []))
+        return out
+
+    all_nodes = _walk_nodes(nodes) if is_recursive_shape else [n for n in nodes if isinstance(n, dict)]
+    impl = [
+        n
+        for n in all_nodes
+        if isinstance(n, dict) and n.get("id") and _node_kind(n) == "composite"
+    ]
+    contracts = [n for n in all_nodes if isinstance(n, dict) and _node_kind(n) == "contract"]
+    node_ids: set[str] = set()
+    for n in nodes:
+        if isinstance(n, dict) and n.get("id"):
+            node_ids.add(str(n["id"]))
+
+    min_impl = 1 if is_recursive_shape else 2
+    if len(impl) < min_impl:
+        errors.append(
+            f"need at least {min_impl} implementation (non-contract) HLIG node(s); got {len(impl)}"
+        )
+
+    linked = 0
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        u = e.get("from") or e.get("source")
+        v = e.get("to") or e.get("target")
+        if u and v and str(u) in node_ids and str(v) in node_ids:
+            linked += 1
+    if len(impl) >= 2 and linked == 0 and not is_recursive_shape:
+        errors.append("need at least one HLIG edge between declared nodes (producer → contract → consumer)")
+
+    if len(impl) >= 2 and len(contracts) < 1:
+        errors.append('need at least one HLIG node with kind "contract" for shared cross-subsystem interfaces')
+
+    return errors
+
+
+def planner_contract_semantic_errors(hlig: dict[str, Any]) -> list[str]:
+    """
+    Enforce contract-first edge semantics:
+    producer module -> contract node -> consumer module.
+    """
+    errs: list[str] = []
+    if not isinstance(hlig, dict):
+        return ["HLIG must be a JSON object."]
+    if isinstance(hlig.get("graph"), dict):
+        g = hlig.get("graph") or {}
+        nodes = g.get("nodes") or []
+        edges = g.get("edges") or []
+    elif isinstance(hlig.get("hlig"), dict):
+        g = hlig.get("hlig") or {}
+        nodes = g.get("nodes") or []
+        edges = g.get("edges") or []
+    else:
+        nodes = hlig.get("nodes") or []
+        edges = hlig.get("edges") or []
+    by_id: dict[str, dict] = {}
+    for n in nodes:
+        if isinstance(n, dict) and n.get("id"):
+            by_id[str(n["id"])] = n
+
+    out_map: dict[str, list[str]] = {}
+    in_map: dict[str, list[str]] = {}
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        u = e.get("from") or e.get("source")
+        v = e.get("to") or e.get("target")
+        if not u or not v:
+            continue
+        su, sv = str(u), str(v)
+        out_map.setdefault(su, []).append(sv)
+        in_map.setdefault(sv, []).append(su)
+
+    for nid, node in by_id.items():
+        if _node_kind(node) != "contract":
+            continue
+        producer = str(node.get("producer") or "").strip()
+        raw_consumers = node.get("consumers") or node.get("implemented_by") or []
+        consumers = [str(x).strip() for x in raw_consumers if str(x).strip()]
+        if not producer and not consumers:
+            # v2 contracts may rely on edges + source_of_truth without producer/consumer lists.
+            continue
+        if producer and producer in by_id:
+            if nid not in out_map.get(producer, []):
+                errs.append(
+                    f"contract '{nid}' missing producer edge: expected '{producer}' -> '{nid}'"
+                )
+        for c in consumers:
+            if c in by_id and c not in out_map.get(nid, []):
+                errs.append(
+                    f"contract '{nid}' missing consumer edge: expected '{nid}' -> '{c}'"
+                )
+        for pred in in_map.get(nid, []):
+            if producer and pred != producer:
+                errs.append(
+                    f"contract '{nid}' has unexpected incoming edge '{pred}' -> '{nid}' (expected producer '{producer}')"
+                )
+        valid_succ = set(consumers) if consumers else set()
+        for succ in out_map.get(nid, []):
+            if valid_succ and succ not in valid_succ:
+                errs.append(
+                    f"contract '{nid}' has unexpected outgoing edge '{nid}' -> '{succ}' (not in consumers)"
+                )
+    return errs
 
 
 def _safe_serialize(obj: Any) -> Any:
@@ -244,7 +402,7 @@ class DTGGraph:
 
     @classmethod
     def from_dict(cls, data: dict) -> "DTGGraph":
-        hlig_id = data.get("hlig_node_id", "")
+        hlig_id = data.get("hlig_node_id", "") or data.get("parent_id", "")
         nodes = data.get("nodes", [])
         edges = data.get("edges", [])
         inst = cls(hlig_id, nodes=nodes, edges=edges)
@@ -373,6 +531,117 @@ class HLIGGraph:
     @classmethod
     def from_planner_hlig(cls, planner_output: dict) -> "HLIGGraph | None":
         """Build HLIGGraph from planner artifact (hlig.nodes, hlig.edges)."""
+        if not isinstance(planner_output, dict):
+            return None
+        recursive = planner_output.get("graph")
+        if isinstance(recursive, dict) and recursive.get("nodes"):
+            hlig_nodes: dict[str, dict] = {}
+            hlig_edges: list[dict] = []
+            dtg_by_owner: dict[str, dict] = {}
+
+            def _edge_dict(e: dict) -> dict:
+                out = {}
+                for k, v in e.items():
+                    if k in ("from", "to", "source", "target"):
+                        continue
+                    out[k] = v
+                return out
+
+            def _normalize_composite(node: dict) -> dict:
+                n = dict(node)
+                n.pop("child_graph", None)
+                n.setdefault("kind", "composite")
+                if "inputs" not in n:
+                    n["inputs"] = list(n.get("inputs_required") or [])
+                if "outputs" not in n:
+                    n["outputs"] = list(n.get("outputs_produced") or [])
+                return n
+
+            def _to_dtg_member(node: dict) -> dict:
+                n = dict(node)
+                n.pop("child_graph", None)
+                kind = _node_kind(n)
+                if kind == "contract":
+                    n.setdefault("task_type", "contract")
+                else:
+                    n.setdefault("task_type", "code")
+                n.setdefault("title", n.get("task") or n.get("id") or "Untitled task")
+                n.setdefault("description", n.get("description") or n.get("task") or n.get("title") or "")
+                n["inputs_required"] = list(n.get("inputs_required") or n.get("inputs") or [])
+                n["outputs_produced"] = list(n.get("outputs_produced") or n.get("outputs") or [])
+                n.setdefault("dependencies", list(n.get("dependencies") or []))
+                n.setdefault("success_criteria", list(n.get("success_criteria") or []))
+                return n
+
+            def _walk_graph(graph_obj: dict, owner_composite: str | None) -> None:
+                nodes_local = [
+                    n for n in (graph_obj.get("nodes") or []) if isinstance(n, dict) and n.get("id")
+                ]
+                by_id_local = {str(n["id"]): n for n in nodes_local}
+                dtg_member_ids: set[str] = set()
+
+                if owner_composite:
+                    dtg_by_owner.setdefault(owner_composite, {"hlig_node_id": owner_composite, "nodes": [], "edges": []})
+
+                for node in nodes_local:
+                    nid = str(node["id"])
+                    kind = _node_kind(node)
+                    if kind in ("composite", "contract"):
+                        normalized = dict(node)
+                        if kind == "composite":
+                            normalized = _normalize_composite(node)
+                        else:
+                            normalized.setdefault("kind", "contract")
+                            normalized.setdefault("node_type", "contract")
+                            normalized.setdefault("name", normalized.get("title") or normalized.get("id"))
+                            sot = normalized.get("source_of_truth")
+                            if isinstance(sot, dict):
+                                normalized.setdefault("schema", sot)
+                                normalized.setdefault("version", sot.get("version"))
+                        hlig_nodes[nid] = normalized
+
+                    if owner_composite and kind in ("atomic", "contract"):
+                        dtg_member_ids.add(nid)
+                        dtg_by_owner[owner_composite]["nodes"].append(_to_dtg_member(node))
+
+                    child_graph = node.get("child_graph")
+                    if kind == "composite" and isinstance(child_graph, dict):
+                        _walk_graph(child_graph, nid)
+
+                for e in graph_obj.get("edges") or []:
+                    if not isinstance(e, dict):
+                        continue
+                    u = str(e.get("from") or e.get("source") or "")
+                    v = str(e.get("to") or e.get("target") or "")
+                    if not u or not v:
+                        continue
+                    ed = {"from": u, "to": v, **_edge_dict(e)}
+                    if owner_composite and u in dtg_member_ids and v in dtg_member_ids:
+                        dtg_by_owner[owner_composite]["edges"].append(ed)
+                    else:
+                        hlig_edges.append(ed)
+
+            _walk_graph(recursive, None)
+
+            if not hlig_nodes:
+                return None
+            node_list = list(hlig_nodes.values())
+            node_ids = {str(n["id"]) for n in node_list if isinstance(n, dict) and n.get("id")}
+            filtered_edges = [e for e in hlig_edges if e.get("from") in node_ids and e.get("to") in node_ids]
+            control, data_edges = _split_hlig_control_and_data_edges(filtered_edges)
+            fixed_control, removed = break_hlig_control_edges_until_dag(control, node_ids)
+            if removed:
+                planner_output["_hlig_cycle_edges_removed"] = removed
+            inst = cls(nodes=node_list, edges=fixed_control + data_edges)
+            _raise_if_cycle(inst._g, "HLIG")
+            for owner, dtg_data in dtg_by_owner.items():
+                if not inst._g.has_node(owner):
+                    continue
+                if not (dtg_data.get("nodes") or []):
+                    continue
+                inst.set_node_dtg(owner, DTGGraph.from_dict(dtg_data))
+            return inst
+
         hlig = planner_output.get("hlig") if isinstance(planner_output, dict) else None
         if not hlig or not isinstance(hlig, dict):
             return None
@@ -416,6 +685,10 @@ class HLIGGraph:
         """
         if not isinstance(data, dict):
             raise TypeError("from_persisted_dict expects a dict")
+        if isinstance(data.get("graph"), dict):
+            converted = cls.from_planner_hlig(data)
+            if converted is not None:
+                return converted
         nodes_raw = data.get("nodes") or []
         edges_raw = data.get("edges") or []
         if not nodes_raw:
@@ -457,13 +730,13 @@ class HLIGGraph:
         if raw.get("nodes"):
             payload = raw
         else:
-            for key in ("hlig_graph", "hlig"):
+            for key in ("graph", "hlig_graph", "hlig"):
                 inner = raw.get(key)
                 if isinstance(inner, dict) and inner.get("nodes"):
-                    payload = inner
+                    payload = {"graph": inner} if key == "graph" else inner
                     break
         if payload is None:
             raise ValueError(
-                "Graph JSON must have top-level 'nodes' or a 'hlig' / 'hlig_graph' object with 'nodes'"
+                "Graph JSON must have top-level 'nodes' or a 'graph' / 'hlig' / 'hlig_graph' object with 'nodes'"
             )
         return cls.from_persisted_dict(payload)

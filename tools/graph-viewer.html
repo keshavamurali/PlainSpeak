@@ -108,14 +108,17 @@
       r.onload = () => {
         try {
           const parsed = JSON.parse(r.result);
-          graphData = parsed.hlig_graph || (parsed.nodes && parsed.edges ? parsed : null);
+          graphData =
+            parsed.hlig_graph ||
+            (parsed.graph && parsed.graph.nodes && parsed.graph.edges ? parsed.graph : null) ||
+            (parsed.nodes && parsed.edges ? parsed : null);
           if (graphData?.nodes?.length) {
             updateViewModeOptions();
             render();
             filenameEl.textContent = f.name;
             clearBtn.style.display = "inline-block";
           } else {
-            alert("Invalid graph. Expected {nodes, edges} or {hlig_graph: {nodes, edges}}");
+            alert("Invalid graph. Expected {nodes, edges}, {graph:{nodes,edges}}, or {hlig_graph:{nodes,edges}}");
           }
         } catch (err) {
           alert("Parse error: " + err.message);
@@ -130,12 +133,12 @@
       sel.innerHTML = '<option value="hlig">HLIG</option>';
       sel.style.display = "none";
       if (!graphData?.nodes?.length) return;
-      const withDtg = graphData.nodes.filter(n => n.dtg?.nodes?.length);
-      if (withDtg.length) {
-        withDtg.forEach(n => {
+      const withChildren = graphData.nodes.filter(n => (n.dtg?.nodes?.length) || (n.child_graph?.nodes?.length));
+      if (withChildren.length) {
+        withChildren.forEach(n => {
           const opt = document.createElement("option");
           opt.value = n.id;
-          opt.textContent = "DTG: " + n.id;
+          opt.textContent = "Child graph: " + n.id;
           sel.appendChild(opt);
         });
         sel.style.display = "inline-block";
@@ -148,7 +151,7 @@
         return { nodes: graphData?.nodes || [], edges: graphData?.edges || [], type: "hlig" };
       }
       const hligNode = graphData.nodes.find(n => n.id === mode);
-      const dtg = hligNode?.dtg;
+      const dtg = hligNode?.dtg || hligNode?.child_graph;
       if (!dtg?.nodes?.length) return { nodes: [], edges: [], type: "dtg" };
       return { nodes: dtg.nodes, edges: dtg.edges || [], type: "dtg", hligId: mode };
     }
@@ -162,7 +165,7 @@
         const baseLabel = type === "hlig"
           ? n.id + "\n" + (n.task || "").slice(0, 40) + (n.task?.length > 40 ? "…" : "")
           : n.id + "\n" + (n.title || "").slice(0, 40) + (n.title?.length > 40 ? "…" : "");
-        const nodeType = n.node_type || n.task_type || "";
+        const nodeType = n.kind || n.node_type || n.task_type || "";
         // Color-code DTG nodes by node_type for easier inspection.
         let color = { background: "#ede9fe", border: "#8b5cf6" };
         if (type === "dtg") {
@@ -194,7 +197,7 @@
           id: "e" + i,
           from: e.from ?? e.source,
           to: e.to ?? e.target,
-          label: (e.interface_type || e.dependency_type || ""),
+          label: (e.dependency_type || e.interface_type || ""),
           arrows: "to",
           dashes: isData,
           color: isData ? { color: "#94a3b8" } : undefined,
@@ -254,7 +257,7 @@
       const to = edge.to ?? edge.target;
       let html = '<div class="node-detail">';
       html += `<dl><dt>Edge</dt><dd><code>${escapeHtml(from)} → ${escapeHtml(to)}</code></dd>`;
-      if (edge.interface_type) html += `<dt>Interface type</dt><dd>${escapeHtml(edge.interface_type)}</dd>`;
+      if (edge.edge_type) html += `<dt>Edge type</dt><dd>${escapeHtml(edge.edge_type)}</dd>`;
       if (edge.dependency_type) html += `<dt>Dependency type</dt><dd>${escapeHtml(edge.dependency_type)}</dd>`;
       if (edge.description) html += `<dt>Description</dt><dd>${escapeHtml(edge.description)}</dd>`;
       if (edge.causal !== undefined) html += `<dt>Causal</dt><dd>${edge.causal ? "Yes" : "No"}</dd>`;
@@ -298,20 +301,25 @@
       html += `<dl><dt>ID</dt><dd><code>${node.id}</code></dd>`;
 
       if (type === "hlig") {
+        if (node.kind) html += `<dt>Kind</dt><dd>${escapeHtml(node.kind)}</dd>`;
         if (node.task) html += `<dt>Task</dt><dd>${escapeHtml(node.task)}</dd>`;
-        if (node.inputs?.length) html += `<dt>Inputs</dt><dd><ul>${node.inputs.map(i => "<li>" + escapeHtml(i) + "</li>").join("")}</ul></dd>`;
-        if (node.outputs?.length) html += `<dt>Outputs</dt><dd><ul>${node.outputs.map(o => "<li>" + escapeHtml(o) + "</li>").join("")}</ul></dd>`;
+        const inputs = node.inputs || node.inputs_required || [];
+        const outputs = node.outputs || node.outputs_produced || [];
+        if (inputs?.length) html += `<dt>Inputs</dt><dd><ul>${inputs.map(i => "<li>" + escapeHtml(i) + "</li>").join("")}</ul></dd>`;
+        if (outputs?.length) html += `<dt>Outputs</dt><dd><ul>${outputs.map(o => "<li>" + escapeHtml(o) + "</li>").join("")}</ul></dd>`;
         if (node.external_interfaces?.length) html += `<dt>Interfaces</dt><dd>${node.external_interfaces.join(", ")}</dd>`;
-        if (node.dtg?.nodes?.length) {
-          html += '<div class="dtg-mini"><h4>DTG (' + node.dtg.nodes.length + ' tasks)</h4>';
+        const child = node.dtg || node.child_graph;
+        if (child?.nodes?.length) {
+          html += '<div class="dtg-mini"><h4>Child Graph (' + child.nodes.length + ' nodes)</h4>';
           html += '<ul style="padding-left:18px;margin:0">';
-          node.dtg.nodes.slice(0, 12).forEach(t => {
+          child.nodes.slice(0, 12).forEach(t => {
             html += '<li><strong>' + escapeHtml(t.id) + '</strong> ' + escapeHtml((t.title || "").slice(0, 50)) + (t.title?.length > 50 ? "…" : "") + '</li>';
           });
-          if (node.dtg.nodes.length > 12) html += '<li>… +' + (node.dtg.nodes.length - 12) + ' more</li>';
+          if (child.nodes.length > 12) html += '<li>… +' + (child.nodes.length - 12) + ' more</li>';
           html += '</ul></div>';
         }
       } else {
+        if (node.kind) html += `<dt>Kind</dt><dd>${escapeHtml(node.kind)}</dd>`;
         if (node.title) html += `<dt>Title</dt><dd>${escapeHtml(node.title)}</dd>`;
         if (node.description) html += `<dt>Description</dt><dd>${escapeHtml(node.description)}</dd>`;
         if (node.task_type) html += `<dt>Type</dt><dd>${escapeHtml(node.task_type)}</dd>`;

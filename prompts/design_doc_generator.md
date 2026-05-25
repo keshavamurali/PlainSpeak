@@ -24,7 +24,7 @@ You MUST respond with valid JSON only. No markdown, no preamble, no explanation.
 {
   "type": "design_spec",
   "version": "1.0",
-  "node_id": "<DTG-X-Y>",
+  "node_id": "<HLIG-...-DTG-X>",
   "title": "<short title>",
   "overview": "<one-line summary for LLM>",
   "goals": ["<goal from success_criteria>"],

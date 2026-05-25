@@ -20,27 +20,30 @@ const getGraphData = (runData) => {
   const pg = runData?.plan_graph;
   const plannerOut = runData?.artifacts?.planner?.output;
   const hlig = plannerOut?.hlig;
+  const recursiveGraph = plannerOut?.graph;
   const causalPaths = runData?.causal_paths ?? {};
 
   let nodes = [];
   let edgesRaw = [];
-  const hligEdges = hlig?.edges || hligGraph?.edges || [];
+  const hligEdges = recursiveGraph?.edges || hlig?.edges || hligGraph?.edges || [];
 
   if (hligGraph?.nodes?.length) {
     nodes = hligGraph.nodes.map((n) => ({
       id: n.id,
-      description: n.task,
+      description: n.task || n.title,
+      kind: n.kind || "composite",
       agent: "coder",
-      reads: n.inputs || [],
-      writes: n.outputs || [],
+      reads: n.inputs || n.inputs_required || [],
+      writes: n.outputs || n.outputs_produced || [],
       status: pg?.nodes?.find((pn) => pn.id === n.id)?.status ?? "pending",
-      dtg: n.dtg,
+      dtg: n.dtg || n.child_graph || null,
       causal_path: causalPaths[n.id] ?? [],
     }));
     edgesRaw = (hligGraph.edges || []).map((e) => ({
       source: e.from ?? e.source,
       target: e.to ?? e.target,
-      interface_type: e.interface_type ?? "dependency",
+      dependency_type: e.dependency_type ?? e.interface_type ?? "dependency",
+      edge_type: e.edge_type ?? "control",
       causal: e.causal !== false,
     }));
   } else if (pg?.nodes?.length) {
@@ -74,7 +77,27 @@ const getGraphData = (runData) => {
     edgesRaw = hligEdges.map((e) => ({
       source: e.from,
       target: e.to,
-      interface_type: e.interface_type,
+      dependency_type: e.dependency_type ?? e.interface_type ?? "dependency",
+      edge_type: e.edge_type ?? "control",
+      causal: e.causal !== false,
+    }));
+  } else if (recursiveGraph?.nodes?.length) {
+    nodes = recursiveGraph.nodes.map((n) => ({
+      id: n.id,
+      description: n.task || n.title,
+      kind: n.kind || "composite",
+      agent: "coder",
+      reads: n.inputs_required || n.inputs || [],
+      writes: n.outputs_produced || n.outputs || [],
+      status: "pending",
+      dtg: n.child_graph || null,
+      causal_path: causalPaths[n.id] ?? [],
+    }));
+    edgesRaw = (recursiveGraph.edges || []).map((e) => ({
+      source: e.from ?? e.source,
+      target: e.to ?? e.target,
+      dependency_type: e.dependency_type ?? "dependency",
+      edge_type: e.edge_type ?? "control",
       causal: e.causal !== false,
     }));
   }
@@ -86,7 +109,8 @@ const getGraphData = (runData) => {
       return {
         source: e.source,
         target: e.target,
-        interface_type: e.interface_type ?? hligE?.interface_type ?? "dependency",
+        dependency_type: e.dependency_type ?? e.interface_type ?? hligE?.dependency_type ?? hligE?.interface_type ?? "dependency",
+        edge_type: e.edge_type ?? hligE?.edge_type ?? "control",
         causal: hligE ? hligE.causal !== false : true,
       };
     });
@@ -103,7 +127,8 @@ const getGraphData = (runData) => {
     type: "edgeWithLabel",
     style: { stroke: "#6366f1", strokeWidth: 2.5 },
     data: {
-      interfaceType: e.interface_type || "dependency",
+      interfaceType: e.dependency_type || "dependency",
+      edgeType: e.edge_type || "control",
       sourceId: e.source,
       targetId: e.target,
       causal: e.causal !== false,
@@ -183,6 +208,11 @@ function GraphNode({ data, selected }) {
       <Handle id="output" type="source" position={Position.Bottom} className="!w-3 !h-3 !bg-slate-300 !border-2 !border-white" />
       <div className="flex items-center justify-between gap-2">
         <div className="text-xs font-bold text-white/90 uppercase tracking-wide">{data?.id}</div>
+        {data?.kind && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/25 text-white/90 font-medium uppercase">
+            {data.kind}
+          </span>
+        )}
         {hasDTG && (
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/25 text-white/90 font-medium">
             {data.dtg.nodes.length} tasks
@@ -542,7 +572,10 @@ const edgeTypes = { edgeWithLabel: EdgeWithLabel };
 /** Build runData from a graph JSON file (nodes + edges). Accepts raw HLIG or {hlig_graph: {...}} */
 function graphFileToRunData(parsed) {
   if (!parsed || typeof parsed !== "object") return null;
-  const hlig = parsed.hlig_graph || (parsed.nodes && parsed.edges ? parsed : null);
+  const hlig =
+    parsed.hlig_graph ||
+    (parsed.nodes && parsed.edges ? parsed : null) ||
+    (parsed.graph && parsed.graph.nodes && parsed.graph.edges ? parsed.graph : null);
   if (!hlig?.nodes?.length) return null;
   return { hlig_graph: hlig, artifacts: {} };
 }
@@ -858,8 +891,11 @@ function HLIGGraphInner({ runId, runData: initialRunData, onSelectRun }) {
                       </p>
                     </div>
                     <div>
-                      <span className="text-slate-500 font-medium">Interface Type</span>
-                      <p className="text-slate-800 font-medium mt-1">{edgeDetails.interfaceType}</p>
+                      <span className="text-slate-500 font-medium">Dependency Type</span>
+                      <p className="text-slate-800 font-medium mt-1">
+                        {edgeDetails.interfaceType}
+                        {edgeDetails.edgeType ? ` (${edgeDetails.edgeType})` : ""}
+                      </p>
                     </div>
                     {edgeDetails.causal !== false && (
                       <div>

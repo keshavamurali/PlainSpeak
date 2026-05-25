@@ -1,0 +1,176 @@
+{
+  "project": {
+    "name": "PlainSpeak Demo",
+    "description": "Sample recursive HLIG/DTG graph for viewer testing."
+  },
+  "artifact_registry": {
+    "entries": {
+      "order_api_contract": {
+        "uri": "contracts/order_api/openapi.yaml",
+        "producer_node_id": "HLIG-1-CONTRACT-1",
+        "media_type": "application/yaml",
+        "checksum": "sha256:demo",
+        "created_at": "2026-05-12T12:00:00Z"
+      },
+      "order_handlers": {
+        "uri": "services/order-api/src/handlers/order.ts",
+        "producer_node_id": "HLIG-1-HLIG-1-DTG-1",
+        "media_type": "text/typescript",
+        "checksum": "sha256:demo2",
+        "created_at": "2026-05-12T12:05:00Z"
+      }
+    }
+  },
+  "graph": {
+    "nodes": [
+      {
+        "id": "HLIG-1",
+        "kind": "composite",
+        "task": "Deliver order management system",
+        "inputs_required": [],
+        "outputs_produced": [
+          "system_release_bundle"
+        ],
+        "language": "TypeScript",
+        "external_interfaces": [
+          "API",
+          "DB"
+        ],
+        "child_graph": {
+          "nodes": [
+            {
+              "id": "HLIG-1-CONTRACT-1",
+              "kind": "contract",
+              "title": "Order API Contract",
+              "contract_type": "api",
+              "source_of_truth": {
+                "uri": "contracts/order_api/openapi.yaml",
+                "format": "openapi",
+                "version": "3.1.0"
+              },
+              "outputs_produced": [
+                "order_api_contract"
+              ],
+              "implemented_by": [
+                "HLIG-1-HLIG-1"
+              ]
+            },
+            {
+              "id": "HLIG-1-HLIG-1",
+              "kind": "composite",
+              "task": "Backend service subsystem",
+              "inputs_required": [
+                "order_api_contract"
+              ],
+              "outputs_produced": [
+                "order_handlers"
+              ],
+              "language": "TypeScript",
+              "external_interfaces": [
+                "API",
+                "DB"
+              ],
+              "child_graph": {
+                "nodes": [
+                  {
+                    "id": "HLIG-1-HLIG-1-DTG-1",
+                    "kind": "atomic",
+                    "title": "Implement order handlers",
+                    "description": "Create API handlers that conform to contract.",
+                    "task_type": "code",
+                    "implementation": {
+                      "language": "typescript",
+                      "framework": "express",
+                      "runtime": "node20",
+                      "build_tool": "tsc",
+                      "package_manager": "npm",
+                      "target": "services/order-api"
+                    },
+                    "inputs_required": [
+                      "order_api_contract"
+                    ],
+                    "outputs_produced": [
+                      "order_handlers"
+                    ],
+                    "dependencies": [],
+                    "success_criteria": [
+                      "All contract routes implemented",
+                      "Build succeeds"
+                    ]
+                  },
+                  {
+                    "id": "HLIG-1-HLIG-1-DTG-2",
+                    "kind": "atomic",
+                    "title": "Run backend unit tests",
+                    "description": "Validate backend handlers against contract behavior.",
+                    "task_type": "test",
+                    "implementation": {
+                      "language": "typescript",
+                      "framework": "jest",
+                      "runtime": "node20",
+                      "package_manager": "npm",
+                      "target": "services/order-api"
+                    },
+                    "test_scope": "unit",
+                    "target_node_ids": [
+                      "HLIG-1-HLIG-1-DTG-1"
+                    ],
+                    "inputs_required": [
+                      "order_handlers"
+                    ],
+                    "outputs_produced": [
+                      "backend_unit_test_report"
+                    ],
+                    "failure_log_artifact": "test_failure_log",
+                    "dependencies": [
+                      "HLIG-1-HLIG-1-DTG-1"
+                    ],
+                    "on_failure": {
+                      "strategy": "retry_causal_parent",
+                      "max_retries": 2,
+                      "inject_error_input_as": "test_failure_log",
+                      "target_task_types": [
+                        "test",
+                        "verification"
+                      ]
+                    },
+                    "success_criteria": [
+                      "All unit tests pass"
+                    ]
+                  }
+                ],
+                "edges": [
+                  {
+                    "from": "HLIG-1-HLIG-1-DTG-1",
+                    "to": "HLIG-1-HLIG-1-DTG-2",
+                    "edge_type": "data",
+                    "dependency_type": "data-flow",
+                    "causal": true,
+                    "data_spec": {
+                      "output_ref": "order_handlers",
+                      "input_ref": "order_handlers"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "edges": [
+            {
+              "from": "HLIG-1-CONTRACT-1",
+              "to": "HLIG-1-HLIG-1",
+              "edge_type": "data",
+              "dependency_type": "data-flow",
+              "causal": true,
+              "data_spec": {
+                "output_ref": "order_api_contract",
+                "input_ref": "order_api_contract"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "edges": []
+  }
+}

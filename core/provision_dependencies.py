@@ -58,6 +58,9 @@ def _collect_interfaces(hlig_graph: HLIGGraph) -> set[str]:
     """Collect all external_interfaces from HLIG nodes."""
     interfaces: set[str] = set()
     for nid, data in hlig_graph.nodes():
+        kind = str(data.get("kind") or "").strip().lower()
+        if kind == "contract":
+            continue
         for iface in data.get("external_interfaces") or []:
             if iface and str(iface) != "None":
                 interfaces.add(str(iface).strip())
@@ -202,7 +205,8 @@ def provision_all(
     results: dict[str, list[str]] = {}
 
     for nid, data in hlig_graph.nodes():
-        if not data.get("dtg"):
+        kind = str(data.get("kind") or "").strip().lower()
+        if kind == "contract":
             continue
         hlig_dir = outputs_dir / nid
         if not hlig_dir.exists() or not hlig_dir.is_dir():

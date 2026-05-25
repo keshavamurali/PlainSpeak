@@ -12,10 +12,12 @@ from shared.state import get_multi_mcp, active_sessions
 import sys
 
 try:
-    from core.debug_logger import log_pipeline_event, CostLimitExceeded
+    from core.debug_logger import log_pipeline_event, CostLimitExceeded, get_session_usage, get_cost_limit_usd
 except ImportError:
     log_pipeline_event = lambda *a, **kw: None
     CostLimitExceeded = Exception  # noqa: type to satisfy isinstance
+    get_session_usage = lambda _sid: {}
+    get_cost_limit_usd = lambda: 0.0
 from agents.runner import AgentRunner
 from core.expansion_engine import EXPANSION_STRATEGIES, default_expansion_strategy_for_node
 from context.execution_context import ExecutionContext
@@ -91,6 +93,10 @@ async def process_run(run_id: str, query: str, pipeline: str | None = None) -> N
             d["status"] = "running"
             d["query"] = query
             d["pending_clarification"] = active_sessions.get(run_id, {}).get("pending_clarification")
+            usage = get_session_usage(run_id)
+            if usage:
+                d["usage"] = usage
+                d["cost_limit_usd"] = get_cost_limit_usd()
             session_manager.save_session(run_id, d)
 
         ctx = await asyncio.to_thread(
@@ -107,6 +113,10 @@ async def process_run(run_id: str, query: str, pipeline: str | None = None) -> N
         data = ctx.to_dict()
         data["status"] = "completed"
         data["query"] = query
+        usage = get_session_usage(run_id)
+        if usage:
+            data["usage"] = usage
+            data["cost_limit_usd"] = get_cost_limit_usd()
         session_manager.save_session(run_id, data)
 
     except Exception as e:
@@ -117,6 +127,10 @@ async def process_run(run_id: str, query: str, pipeline: str | None = None) -> N
         data["status"] = "failed"
         data["query"] = query
         data["error"] = err_msg
+        usage = get_session_usage(run_id)
+        if usage:
+            data["usage"] = usage
+            data["cost_limit_usd"] = get_cost_limit_usd()
         session_manager.save_session(run_id, data)
         # Show error on command line when running server
         print(f"\n[PlainSpeak] Run {run_id} FAILED: {err_msg}\n", file=sys.stderr, flush=True)
@@ -234,7 +248,11 @@ def _compute_causal_paths(hlig_graph: dict) -> dict:
         for nid, _ in g.nodes():
             path_tuples = g.get_causal_path(nid)
             result[nid] = [
-                {"id": pid, "task": d.get("task", ""), "outputs": d.get("outputs", [])}
+                {
+                    "id": pid,
+                    "task": d.get("task", d.get("title", "")),
+                    "outputs": d.get("outputs", d.get("outputs_produced", [])),
+                }
                 for pid, d in path_tuples
             ]
         return result
@@ -259,8 +277,8 @@ def _enrich_hlig_graph(hlig_graph: dict) -> dict:
         parent_hlig = {
             "id": node.get("id", ""),
             "task": node.get("task"),
-            "inputs": node.get("inputs", []),
-            "outputs": node.get("outputs", []),
+            "inputs": node.get("inputs", node.get("inputs_required", [])),
+            "outputs": node.get("outputs", node.get("outputs_produced", [])),
             "language": node.get("language", "Rust, Tauri, React, CSS"),
             "external_interfaces": node.get("external_interfaces", []),
         }
@@ -271,6 +289,12 @@ def _enrich_hlig_graph(hlig_graph: dict) -> dict:
                 n["language"] = lang
             if isinstance(n, dict):
                 tt = (n.get("task_type") or "").lower()
+                impl = n.get("implementation")
+                if not isinstance(impl, dict):
+                    impl = {}
+                impl.setdefault("language", lang)
+                impl.setdefault("framework", "auto")
+                n["implementation"] = impl
                 if tt in ("code", "integration", "test", "build", "verification", "scaffold"):
                     es = (n.get("expansion_strategy") or "").strip()
                     if not es or es not in EXPANSION_STRATEGIES:
@@ -299,6 +323,14 @@ def _run_to_response(data: dict) -> dict:
     gs = data.get("globals_schema") or {}
     if gs.get("artifact_outputs_path"):
         result["artifact_outputs_path"] = gs["artifact_outputs_path"]
+    if gs.get("clarification_answers") is not None:
+        result["clarification_answers"] = gs["clarification_answers"]
+    if gs.get("clarification_canonical") is not None:
+        result["clarification_canonical"] = gs["clarification_canonical"]
+    if data.get("usage") is not None:
+        result["usage"] = data["usage"]
+    if data.get("cost_limit_usd") is not None:
+        result["cost_limit_usd"] = data["cost_limit_usd"]
     if data.get("hlig_graph") is not None:
         hlig = copy.deepcopy(data["hlig_graph"])
         result["hlig_graph"] = _enrich_hlig_graph(hlig)

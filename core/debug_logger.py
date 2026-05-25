@@ -137,6 +137,11 @@ def get_session_usage(session_id: str) -> dict:
     return dict(_session_usage.get(key, {}))
 
 
+def get_cost_limit_usd() -> float:
+    """Return configured cost limit in USD (0 disables limit)."""
+    return float(_COST_LIMIT)
+
+
 def check_cost_limit_before_llm(session_id: str) -> None:
     """
     If session cost already >= limit, raise CostLimitExceeded so caller skips the LLM call.
@@ -187,7 +192,14 @@ def log_llm_call(
         if session_id:
             totals = get_session_usage(session_id)
             cum_cost = totals.get("cost_usd", 0)
-            entry += f"CUMULATIVE: cost=${cum_cost:.6f} (this run so far)\n"
+            cum_in = totals.get("input_tokens", 0)
+            cum_out = totals.get("output_tokens", 0)
+            cum_total = totals.get("total_tokens", cum_in + cum_out)
+            entry += (
+                "CUMULATIVE: "
+                f"input={cum_in} output={cum_out} total={cum_total} "
+                f"cost=${cum_cost:.6f} (this run so far)\n"
+            )
     if variable_input is not None:
         inp_str = _truncate(variable_input)
         entry += f"INPUT (variable part only, prompt template omitted, {len(variable_input)} chars):\n{inp_str}\n"

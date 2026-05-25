@@ -604,6 +604,29 @@ def _infer_framework(hlig_node: dict) -> str:
     return "rust-tauri"
 
 
+def _framework_for_atomic_node(node: dict, default_framework: str) -> str:
+    """
+    Resolve framework for an atomic DTG node from explicit implementation metadata.
+    Falls back to HLIG-level inferred framework for backward compatibility.
+    """
+    impl = node.get("implementation")
+    if not isinstance(impl, dict):
+        return default_framework
+    fw = str(impl.get("framework") or "").strip().lower()
+    lang = str(impl.get("language") or "").strip().lower()
+    if fw in ("react", "vite", "nextjs", "next", "node-react"):
+        return "node-react"
+    if fw in ("express", "fastify", "nestjs", "jest", "vitest", "playwright", "node", "npm"):
+        return "node-react"
+    if fw in ("tauri", "rust", "axum", "actix", "rocket", "cargo", "rust-tauri"):
+        return "rust-tauri"
+    if any(x in lang for x in ("typescript", "javascript", "node")):
+        return "node-react"
+    if "rust" in lang:
+        return "rust-tauri"
+    return default_framework
+
+
 def _prune_empty_rust_scaffold(hlig_dir: Path) -> None:
     """Remove Cargo stub from a prior rust-tauri mis-inference when this HLIG is node-react."""
     cargo = hlig_dir / "Cargo.toml"
@@ -1674,27 +1697,39 @@ def _safe_filename(name: str) -> str:
     return re.sub(r"[^\w\-_]", "_", name).strip("_") or "untitled"
 
 
+def _is_contract_hlig_node(attrs: dict) -> bool:
+    kind = str(attrs.get("kind") or "").strip().lower()
+    if kind:
+        return kind == "contract"
+    return (attrs.get("node_type") or "").lower() == "contract"
+
+
 def _get_interfaces_for_hlig(hlig_graph: HLIGGraph, hlig_id: str) -> list[dict]:
     """Extract interface definitions from HLIG contract nodes and edges involving this HLIG."""
     result: list[dict] = []
     for nid, attrs in hlig_graph.nodes():
-        if (attrs.get("node_type") or "").lower() != "contract":
+        if not _is_contract_hlig_node(attrs):
             continue
-        prod = attrs.get("producer")
-        cons = attrs.get("consumers") or []
+        impl_by = attrs.get("implemented_by") or []
+        cons = attrs.get("consumers") or impl_by
         if not isinstance(cons, list):
             cons = []
+        prod = attrs.get("producer")
         if hlig_id != prod and hlig_id not in cons:
             continue
-        schema = attrs.get("schema") if isinstance(attrs.get("schema"), dict) else {}
+        schema = {}
+        if isinstance(attrs.get("source_of_truth"), dict):
+            schema = dict(attrs.get("source_of_truth") or {})
+        elif isinstance(attrs.get("schema"), dict):
+            schema = dict(attrs.get("schema") or {})
         result.append(
             {
                 "from": prod,
                 "to": list(cons),
                 "interface_type": "contract",
                 "contract_node_id": nid,
-                "name": attrs.get("name"),
-                "version": attrs.get("version"),
+                "name": attrs.get("name") or attrs.get("title"),
+                "version": attrs.get("version") or schema.get("version"),
                 **{k: v for k, v in schema.items() if k in ("type", "description", "endpoints", "schema", "ref")},
             }
         )
@@ -1703,12 +1738,23 @@ def _get_interfaces_for_hlig(hlig_graph: HLIGGraph, hlig_id: str) -> list[dict]:
             continue
         spec = data.get("interface_spec")
         ref = data.get("interface_ref")
+        data_spec = data.get("data_spec")
         if spec and isinstance(spec, dict):
             result.append({
                 "from": u, "to": v,
                 "interface_type": data.get("interface_type", "dependency"),
                 **{k: v for k, v in spec.items() if k in ("type", "description", "endpoints", "schema", "ref")},
             })
+        elif data_spec and isinstance(data_spec, dict):
+            result.append(
+                {
+                    "from": u,
+                    "to": v,
+                    "interface_type": "data-flow",
+                    "output_ref": data_spec.get("output_ref"),
+                    "input_ref": data_spec.get("input_ref"),
+                }
+            )
         elif ref:
             result.append({"from": u, "to": v, "interface_ref": ref, "interface_type": data.get("interface_type", "dependency")})
     return result
@@ -1720,9 +1766,24 @@ def _write_interface_definitions(hlig_graph: HLIGGraph, outputs_dir: Path) -> No
     Both Frontend and Backend can read this file during code generation.
     """
     by_edge: dict[str, dict] = {}
+    by_contract: dict[str, dict] = {}
+    for nid, attrs in hlig_graph.nodes():
+        if not _is_contract_hlig_node(attrs):
+            continue
+        source = attrs.get("source_of_truth")
+        schema = source if isinstance(source, dict) else attrs.get("schema")
+        by_contract[str(nid)] = {
+            "id": nid,
+            "name": attrs.get("name") or attrs.get("title") or nid,
+            "contract_type": attrs.get("contract_type") or "contract",
+            "source_of_truth": schema if isinstance(schema, dict) else {},
+            "implemented_by": list(attrs.get("implemented_by") or attrs.get("consumers") or []),
+            "producer": attrs.get("producer"),
+        }
     for u, v, data in hlig_graph.edges():
         spec = data.get("interface_spec")
         ref = data.get("interface_ref")
+        data_spec = data.get("data_spec")
         if spec and isinstance(spec, dict):
             key = f"{u}→{v}"
             by_edge[key] = {
@@ -1734,11 +1795,20 @@ def _write_interface_definitions(hlig_graph: HLIGGraph, outputs_dir: Path) -> No
         elif ref:
             key = f"{u}→{v}"
             by_edge[key] = {"from": u, "to": v, "interface_ref": ref, "interface_type": data.get("interface_type", "dependency")}
-    if not by_edge:
+        elif data_spec and isinstance(data_spec, dict):
+            key = f"{u}→{v}"
+            by_edge[key] = {
+                "from": u,
+                "to": v,
+                "interface_type": "data-flow",
+                "output_ref": data_spec.get("output_ref"),
+                "input_ref": data_spec.get("input_ref"),
+            }
+    if not by_edge and not by_contract:
         return
     shared_dir = outputs_dir / "shared"
     shared_dir.mkdir(parents=True, exist_ok=True)
-    out = {"by_edge": by_edge}
+    out = {"by_edge": by_edge, "by_contract": by_contract}
     (shared_dir / "interfaces.json").write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
 
 
@@ -2803,7 +2873,7 @@ path = "src/main.rs"
                 node=node,
                 hlig_dir=hlig_dir,
                 hlig_node=hlig_node,
-                framework=framework,
+                framework=_framework_for_atomic_node(node, framework),
                 session_id=session_id,
                 hlig_graph=hlig_graph,
                 hlig_id=hlig_id,
@@ -2872,7 +2942,7 @@ path = "src/main.rs"
 
         for nid in topo_order:
             data = node_data_by_id.get(nid, {})
-            if (data.get("node_type") or "").lower() == "contract":
+            if _is_contract_hlig_node(data):
                 continue
             dtg = data.get("dtg")
             if not isinstance(dtg, DTGGraph):
@@ -2944,7 +3014,7 @@ path = "src/main.rs"
 
         for nid in topo_order:
             data = node_data_by_id.get(nid, {})
-            if (data.get("node_type") or "").lower() == "contract":
+            if _is_contract_hlig_node(data):
                 continue
             dtg = data.get("dtg")
             if not isinstance(dtg, DTGGraph):
@@ -3016,7 +3086,7 @@ path = "src/main.rs"
                         node=node,
                         hlig_dir=hlig_dir,
                         hlig_node=hlig_node,
-                        framework=framework,
+                        framework=_framework_for_atomic_node(node, framework),
                         session_id=session_id,
                         hlig_graph=hlig_graph,
                         hlig_id=nid,
@@ -3070,7 +3140,7 @@ path = "src/main.rs"
 
         for nid in topo_order:
             data = node_data_by_id.get(nid, {})
-            if (data.get("node_type") or "").lower() == "contract":
+            if _is_contract_hlig_node(data):
                 continue
             dtg = data.get("dtg")
             if not isinstance(dtg, DTGGraph):

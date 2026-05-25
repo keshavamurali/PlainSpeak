@@ -1,6 +1,6 @@
 # PlainSpeak
 
-**PlainSpeak** turns natural-language software requests into **structured graphs** and **generated artifacts** (design specs, code, tests) using a pipeline of LLM agents. You describe what you want in plain language; the system builds a **High-Level Intent Graph (HLIG)** of subsystems, expands each subsystem into a **Detailed Task Graph (DTG)** of tasks, then runs designers, coders, reviewers, and optional local builds so outputs land under `session_log/` for inspection and iteration.
+**PlainSpeak** turns natural-language software requests into **structured graphs** and **generated artifacts** (design specs, code, tests) using a pipeline of LLM agents. You describe what you want in plain language; the system builds a **recursive High-Level Intent Graph (HLIG)** of composite, atomic, and contract nodes, then runs designers, coders, reviewers, and optional local builds so outputs land under `session_log/` for inspection and iteration.
 
 The project is aimed at **LLM-agnostic**, **deterministic** graph formats and **traceable** runs (causal edges, dependency matrix pins, build logs) so generated code stays aligned with a single specification.
 
@@ -8,7 +8,7 @@ The project is aimed at **LLM-agnostic**, **deterministic** graph formats and **
 
 ## Language specification (HLIG / DTG)
 
-The full formal schema—node/edge shapes, `task_type`, CVP (`causal`), interface specs, control vs data flow, and validation rules—is defined here:
+The full formal schema—recursive `graph`/`child_graph`, node `kind`, `task_type`, CVP (`causal`), contract nodes, artifact registry, and validation rules—is defined here:
 
 **[language_readme.md](language_readme.md)** — *HLIG/DTG Language Specification* (authoritative reference).
 
@@ -91,7 +91,7 @@ Session artifacts, graphs, and generated code are written under **`session_log/s
 
 ### 6. Pipelines and cost
 
-- **`hlig_full`** — Planner → Designer → Design doc generator → Design reviewer → Coder → … (full HLIG pipeline).  
+- **`hlig_full`** — Planner → Designer (`child_graph`) → Design doc generator → Design reviewer → Coder → … (full recursive pipeline).  
 - **`hlig_no_design_docs`** — Skips separate design-doc LLM steps; faster / lower cost (common default).  
 - Pipelines are listed in **`agents/config/agents.yaml`** under `pipelines:`.
 
@@ -111,7 +111,7 @@ For env toggles (local `cargo`/`npm` checks, truncation, cost limits), see **`pr
 
 ## External dependencies (DB, Auth, Storage)
 
-PlainSpeak can auto-provision mock config for external interfaces declared on HLIG nodes (`DB`, `Auth`, `Storage`, `Filesystem`, `API`, etc.). After artifact generation, you may see:
+PlainSpeak can auto-provision mock config for external interfaces declared on composite HLIG nodes (`DB`, `Auth`, `Storage`, `Filesystem`, `API`, etc.). After artifact generation, you may see:
 
 - **`.env`** / **`.env.test`** — mock URLs (e.g. SQLite, local paths)  
 - **`data/`**, **`storage/`** — local storage dirs  
@@ -124,8 +124,8 @@ For real services, see project notes on `provision_dependencies` / Docker Compos
 
 A typical full pipeline runs agents in order, for example:
 
-1. **Planner** — Builds HLIG from the user request  
-2. **Designer** — Builds a DTG per HLIG node  
+1. **Planner** — Builds recursive HLIG graph from the user request  
+2. **Designer** — Builds `child_graph` (atomic DTGs + contract nodes) per HLIG composite  
 3. **Design doc generator** — (if pipeline includes it) design JSON for design-type DTG nodes  
 4. **Design reviewer** — Reviews graphs  
 5. **Coder** — Generates design artifacts and code per DTG  

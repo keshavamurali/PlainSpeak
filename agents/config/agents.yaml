@@ -1,50 +1,56 @@
 # Agent pipeline configuration - agent types are defined by prompts
 
-default_pipeline: hlig_no_design_docs
+default_pipeline: hlig_planning_only
 
 pipelines:
-  # Full HLIG pipeline: Planner -> Designer -> Design Doc Gen -> Design Review -> Code -> Code Review -> Build -> Testers
+  # Planning-only mode (v2):
+  # Natural language -> clarification loop -> recursive graph with composite/atomic/contract nodes.
+  hlig_planning_only:
+    - planner
+
+  # Full recursive pipeline:
+  # Planner -> Designer(child_graph) -> Design Doc Gen -> Design Review -> Code -> Code Review -> Build -> Testers
   hlig_full:
     - planner
-    - designer
-    - design_doc_generator
-    - design_reviewer
-    - coder
-    - code_reviewer
-    - builder
-    - unit_tester
-    - integration_tester
-    - system_tester
+    # - designer
+    # - design_doc_generator
+    # - design_reviewer
+    # - coder
+    # - code_reviewer
+    # - builder
+    # - unit_tester
+    # - integration_tester
+    # - system_tester
 
   # Cost-optimized: skip design docs and design review, go straight to code
   hlig_no_design_docs:
     - planner
-    - designer
-    - coder
-    - code_reviewer
-    - builder
-    - unit_tester
-    - integration_tester
-    - system_tester
+    # - designer
+    # - coder
+    # - code_reviewer
+    # - builder
+    # - unit_tester
+    # - integration_tester
+    # - system_tester
 
   default:
     - planner
-    - clarification
-    - coder
-    - reviewer
+    # - clarification
+    # - coder
+    # - reviewer
 
   minimal:
     - planner
-    - coder
+    # - coder
 
 steps:
   - name: planner
     prompt_file: prompts/planner.md
-    description: Analyze requirements and produce HLIG (High-Level Intent Graph)
+    description: Analyze requirements and produce recursive graph (HLIG composites + contract nodes)
 
   - name: designer
     prompt_file: prompts/dtg_generator.md
-    description: Build DTG (Detailed Task Graph) for each HLIG node
+    description: Build child_graph (atomic DTGs + contracts) for each HLIG composite node
     config:
       max_design_nodes: 4
       max_code_nodes: 8

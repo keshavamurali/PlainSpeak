@@ -30,11 +30,12 @@ except ImportError:
 
 # --- Spec constants (from language_readme.md) ---------------------------------
 
-HLIG_ID_PATTERN = re.compile(r"^HLIG-[A-Za-z0-9_-]+$")
-DTG_ID_PATTERN = re.compile(r"^DTG-(\d+)-\d+$")
+HLIG_ID_PATTERN = re.compile(r"^HLIG-[A-Za-z0-9_-]+(?:-HLIG-[A-Za-z0-9_-]+)*$")
+DTG_ID_PATTERN = re.compile(r"^(?:HLIG-[A-Za-z0-9_-]+-)*DTG-[A-Za-z0-9_-]+$")
+CONTRACT_ID_PATTERN = re.compile(r"^(?:HLIG-[A-Za-z0-9_-]+-)*CONTRACT-[A-Za-z0-9_-]+$")
 
 HLIG_REQUIRED_NODE = {"id", "task", "inputs", "outputs"}
-HLIG_OPTIONAL_NODE = {"language", "external_interfaces", "dtg_root", "dtg"}
+HLIG_OPTIONAL_NODE = {"language", "external_interfaces", "dtg_root", "dtg", "kind", "child_graph", "inputs_required", "outputs_produced"}
 HLIG_EXTERNAL_INTERFACES = {"API", "DB", "Filesystem", "Auth", "message", "None"}
 
 DTG_REQUIRED_NODE = {
@@ -57,6 +58,12 @@ DTG_OPTIONAL_NODE = {
     "expansion_strategy",
     "type",
     "section",
+    "implementation",
+    "on_failure",
+    "test_scope",
+    "target_node_ids",
+    "failure_log_artifact",
+    "kind",
 }
 DTG_TASK_TYPES = {
     "design",
@@ -79,10 +86,28 @@ def _normalize_graph(data: dict) -> tuple[list, list]:
     """Return (nodes, edges) from various top-level shapes."""
     if "nodes" in data and "edges" in data:
         return data["nodes"], data["edges"]
+    graph = data.get("graph")
+    if isinstance(graph, dict):
+        return graph.get("nodes", []), graph.get("edges", [])
     hlig = data.get("hlig")
     if isinstance(hlig, dict):
         return hlig.get("nodes", []), hlig.get("edges", [])
     return [], []
+
+
+def _node_kind(node: dict[str, Any]) -> str:
+    kind = str(node.get("kind") or "").strip().lower()
+    if kind:
+        return kind
+    node_type = str(node.get("node_type") or "").strip().lower()
+    if node_type == "contract":
+        return "contract"
+    nid = str(node.get("id") or "").upper()
+    if "-DTG-" in nid or nid.startswith("DTG-"):
+        return "atomic"
+    if "-CONTRACT-" in nid:
+        return "contract"
+    return "composite"
 
 
 def _check_acyclic(nodes: list[dict], edges: list[dict], node_id_key: str = "id") -> list[str]:
@@ -134,39 +159,71 @@ def validate_hlig(data: dict, strict_canonical_names: bool = False) -> list[str]
         if not nid:
             errs.append(f"HLIG node at index {i} missing 'id'")
             continue
-        if not HLIG_ID_PATTERN.match(nid):
-            errs.append(f"HLIG node id '{nid}' does not match pattern HLIG-<alphanumeric>")
+        kind = _node_kind(n)
+        if kind == "composite" and not HLIG_ID_PATTERN.match(nid):
+            errs.append(f"HLIG node id '{nid}' does not match recursive HLIG pattern")
+        if kind == "contract" and not (CONTRACT_ID_PATTERN.match(nid) or HLIG_ID_PATTERN.match(nid)):
+            errs.append(f"Contract node id '{nid}' should follow recursive CONTRACT pattern")
         if nid in node_ids:
             errs.append(f"Duplicate HLIG node id '{nid}'")
         node_ids.add(nid)
 
-        if (n.get("node_type") or "").lower() == "contract":
-            c_missing = []
-            for fld in ("name", "producer", "version"):
-                if not n.get(fld):
-                    c_missing.append(fld)
-            if not isinstance(n.get("consumers"), list) or not n.get("consumers"):
-                c_missing.append("consumers")
-            if "schema" not in n or not isinstance(n.get("schema"), dict):
-                c_missing.append("schema")
-            if c_missing:
-                errs.append(
-                    f"HLIG contract node '{nid}' missing or invalid fields: {sorted(set(c_missing))}"
-                )
+        if kind == "contract":
+            if n.get("source_of_truth") is not None:
+                sot = n.get("source_of_truth")
+                if not isinstance(sot, dict) or not sot.get("uri"):
+                    errs.append(f"HLIG contract node '{nid}': source_of_truth must be an object with 'uri'")
+            else:
+                c_missing = []
+                for fld in ("name", "producer", "version"):
+                    if not n.get(fld):
+                        c_missing.append(fld)
+                if not isinstance(n.get("consumers"), list) or not n.get("consumers"):
+                    c_missing.append("consumers")
+                if "schema" not in n or not isinstance(n.get("schema"), dict):
+                    c_missing.append("schema")
+                if c_missing:
+                    errs.append(
+                        f"HLIG contract node '{nid}' missing or invalid fields: {sorted(set(c_missing))}"
+                    )
             continue
 
-        missing = HLIG_REQUIRED_NODE - set(n.keys())
+        if kind == "atomic":
+            # v2 DTG-as-atomic nodes inside child_graph
+            req_atomic = {"title", "description", "task_type", "inputs_required", "outputs_produced", "dependencies", "success_criteria"}
+            missing_atomic = [f for f in req_atomic if f not in n]
+            if missing_atomic:
+                errs.append(f"Atomic node '{nid}' missing required fields: {sorted(missing_atomic)}")
+            if not DTG_ID_PATTERN.match(nid):
+                errs.append(f"Atomic node id '{nid}' does not match recursive DTG pattern")
+            tt = n.get("task_type")
+            if tt and tt not in DTG_TASK_TYPES:
+                errs.append(f"Atomic node '{nid}': task_type '{tt}' not in {DTG_TASK_TYPES}")
+            continue
+
+        # v2 composite supports inputs_required/outputs_produced aliases
+        missing = set()
+        if "task" not in n:
+            missing.add("task")
+        has_inputs = "inputs" in n or "inputs_required" in n
+        has_outputs = "outputs" in n or "outputs_produced" in n
+        if not has_inputs:
+            missing.add("inputs|inputs_required")
+        if not has_outputs:
+            missing.add("outputs|outputs_produced")
         if missing:
             errs.append(f"HLIG node '{nid}' missing required fields: {sorted(missing)}")
 
-        if "inputs" in n and not isinstance(n["inputs"], list):
-            errs.append(f"HLIG node '{nid}': 'inputs' must be an array")
-        if "outputs" in n and not isinstance(n["outputs"], list):
-            errs.append(f"HLIG node '{nid}': 'outputs' must be an array")
+        inputs_val = n.get("inputs") if "inputs" in n else n.get("inputs_required")
+        outputs_val = n.get("outputs") if "outputs" in n else n.get("outputs_produced")
+        if inputs_val is not None and not isinstance(inputs_val, list):
+            errs.append(f"HLIG node '{nid}': inputs/inputs_required must be an array")
+        if outputs_val is not None and not isinstance(outputs_val, list):
+            errs.append(f"HLIG node '{nid}': outputs/outputs_produced must be an array")
 
         if strict_canonical_names:
-            for label, key in [("inputs", "inputs"), ("outputs", "outputs")]:
-                for val in (n.get(key) or []):
+            for label, vals in [("inputs", inputs_val or []), ("outputs", outputs_val or [])]:
+                for val in vals:
                     if isinstance(val, str) and not _snake_case_like(val):
                         errs.append(
                             f"HLIG node '{nid}': {label} should use canonical names (snake_case); got '{val}'"
@@ -201,6 +258,26 @@ def validate_hlig(data: dict, strict_canonical_names: bool = False) -> list[str]
     errs.extend(validate_hlig_contract_nodes(nodes, edges))
 
     return errs
+
+
+def _validate_recursive_child_graph(nodes: list[dict], errs: list[str], strict_canonical_names: bool) -> None:
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        child = n.get("child_graph")
+        if child is None:
+            continue
+        if not isinstance(child, dict):
+            errs.append(f"Node '{n.get('id', '?')}': child_graph must be an object")
+            continue
+        cnodes = child.get("nodes", [])
+        cedges = child.get("edges", [])
+        if not isinstance(cnodes, list) or not isinstance(cedges, list):
+            errs.append(f"Node '{n.get('id', '?')}': child_graph must contain arrays 'nodes' and 'edges'")
+            continue
+        sub_errs = validate_hlig({"nodes": cnodes, "edges": cedges}, strict_canonical_names=strict_canonical_names)
+        errs.extend([f"[child_graph {n.get('id', '?')}] {e}" for e in sub_errs])
+        _validate_recursive_child_graph(cnodes, errs, strict_canonical_names)
 
 
 def contract_first_warnings(nodes: list[dict]) -> list[str]:
@@ -422,6 +499,7 @@ def validate_graph(data: dict, strict_canonical_names: bool = False) -> dict[str
     if nodes or edges:
         hlig_data = {"nodes": nodes, "edges": edges}
         result["hlig_errors"] = validate_hlig(hlig_data, strict_canonical_names=strict_canonical_names)
+        _validate_recursive_child_graph(nodes, result["hlig_errors"], strict_canonical_names=strict_canonical_names)
         if result["hlig_errors"]:
             result["errors"].extend(result["hlig_errors"])
             result["ok"] = False

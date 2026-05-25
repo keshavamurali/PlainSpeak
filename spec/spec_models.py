@@ -85,19 +85,26 @@ def minimal_spec_from_intent(intent_text: str) -> dict[str, Any]:
 def spec_from_hlig_and_intent(hlig: dict[str, Any], intent_text: str) -> dict[str, Any]:
     """Synthesize SPEC from an existing HLIG object (backward compatibility)."""
     nodes = hlig.get("nodes") or []
+    if not nodes and isinstance(hlig.get("graph"), dict):
+        nodes = (hlig.get("graph") or {}).get("nodes") or []
     modules: list[dict[str, Any]] = []
     contracts: list[dict[str, Any]] = []
     for n in nodes:
         if not isinstance(n, dict) or not n.get("id"):
             continue
-        if (n.get("node_type") or "").lower() == "contract":
+        kind = str(n.get("kind") or "").strip().lower()
+        is_contract = kind == "contract" or (n.get("node_type") or "").lower() == "contract"
+        if is_contract:
+            schema = n.get("schema") if isinstance(n.get("schema"), dict) else {}
+            if isinstance(n.get("source_of_truth"), dict):
+                schema = n.get("source_of_truth") or {}
             contracts.append(
                 {
-                    "name": n.get("name") or n.get("id"),
+                    "name": n.get("name") or n.get("title") or n.get("id"),
                     "producer": n.get("producer") or "",
-                    "consumers": list(n.get("consumers") or []),
-                    "schema": n.get("schema") if isinstance(n.get("schema"), dict) else {},
-                    "version": str(n.get("version") or "v1"),
+                    "consumers": list(n.get("consumers") or n.get("implemented_by") or []),
+                    "schema": schema,
+                    "version": str(n.get("version") or schema.get("version") or "v1"),
                 }
             )
             continue
@@ -162,6 +169,12 @@ def merge_planner_spec_with_hlig(
     if isinstance(hlig, dict) and hlig.get("nodes"):
         try:
             return generate_spec_from_intent(intent_text, fallback_hlig=hlig)
+        except ValueError:
+            pass
+    graph = planner_output.get("graph")
+    if isinstance(graph, dict) and graph.get("nodes"):
+        try:
+            return generate_spec_from_intent(intent_text, fallback_hlig={"graph": graph})
         except ValueError:
             pass
     return minimal_spec_from_intent(intent_text)
